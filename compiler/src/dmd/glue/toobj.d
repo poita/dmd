@@ -824,6 +824,11 @@ void toObjFile(Dsymbol ds, bool multiobj)
                 }
                 //printf("TemplateInstance.toObjFile(%p, '%s')\n", ti, ti.toPrettyChars());
 
+                // in a compilation split across worker processes, one generates it
+                import dmd.glue : instanceGeneratedHere;
+                if (!instanceGeneratedHere(ti))
+                    return;
+
                 if (multiobj)
                 {
                     // Append to list of object files to be written later

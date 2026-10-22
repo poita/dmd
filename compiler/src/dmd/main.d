@@ -665,54 +665,8 @@ private int tryMain(const(char)[][] argv, out Param params)
     if (global.errors)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
-    /* Split the rest of the compilation of the root modules across worker processes,
-     * when nothing but code generation needs all of them. On Mach-O, the parts of one
-     * object file are combined with `ld -r`, which replaces their debug information with
-     * a debug map pointing at the parts, so an object file with debug information is
-     * not split.
-     */
-    const debugMap = driverParams.symdebug && driverParams.oneobj && !driverParams.lib &&
-        target.objectFormat() == Target.ObjectFormat.macho;
-    if (driverParams.workers != 1 && params.obj && !includeImports && !params.addMain && !debugMap &&
-        !params.json.doOutput && !params.ddoc.doOutput && !params.vcg_ast &&
-        !params.cxxhdr.doOutput && !params.moduleDeps.buffer && !params.dihdr.doOutput &&
-        !params.timeTrace && !params.v.verbose && !params.v.templates && !params.makeDeps.doOutput)
-    {
-        workers = split(modules, driverParams.workers);
-        if (workers.isChild)
-        {
-            import dmd.glue : outputPartSuffix;
-            outputPartSuffix = partSuffix(workers.index);
-        }
-        else if (workers.count)
-        {
-            /* Combine the workers' output parts; if the workers did not all succeed,
-             * this process compiles the modules itself
-             */
-            import dmd.glue : libraryFileName, oneObjectFileName, mergeLibraries;
-            const output = driverParams.lib ? libraryFileName(params.libname, params.objdir) :
-                           driverParams.oneobj ? oneObjectFileName(modules[]) : null;
-            if (output.length)
-            {
-                auto parts = partNames(output, workers.count);
-                if (workers.succeeded)
-                    workers.succeeded = driverParams.lib ? mergeLibraries(output, libmodules[], parts) :
-                                                           mergeObjects(output, parts);
-                removeParts(parts);
-            }
-        }
-    }
-
-    if (!workers.succeeded)
-    {
-
     // Do pass 3 semantic analysis
-    if (workers.isChild)
-    {
-        import dmd.parallel : semantic3Shared;
-        semantic3Shared(workers, modules);
-    }
-    else foreach (m; modules)
+    foreach (m; modules)
     {
         if (params.v.verbose)
             eSink.message(Loc.initial, "semantic3 %s", m.toChars());
@@ -733,11 +687,6 @@ private int tryMain(const(char)[][] argv, out Param params)
         }
     }
     runDeferredSemantic3();
-    if (workers.isChild)
-    {
-        import dmd.parallel : adoptForeignInstances;
-        adoptForeignInstances(workers, modules);
-    }
     if (global.errors)
         removeHdrFilesAndFail(params.dihdr.doOutput, modules);
 
@@ -765,7 +714,6 @@ private int tryMain(const(char)[][] argv, out Param params)
                 eSink.message(Loc.initial, "scan all inlines in %s", m.toChars());
             inlineScanAllFunctions(m, eSink);
         }
-    }
     }
     }
 
@@ -854,6 +802,48 @@ private int tryMain(const(char)[][] argv, out Param params)
         modules.push(mainModule);
         if (!driverParams.oneobj || modules.length == 1)
             params.objfiles.push(mainModule.objfile.toChars());
+    }
+
+    /* Split the code generation of the root modules across worker processes, which
+     * start from the state of this process once everything but code generation is
+     * done. On Mach-O, the parts of one object file are combined with `ld -r`, which
+     * replaces their debug information with a debug map pointing at the parts, so an
+     * object file with debug information is not split.
+     */
+    const debugMap = driverParams.symdebug && driverParams.oneobj && !driverParams.lib &&
+        target.objectFormat() == Target.ObjectFormat.macho;
+    if (driverParams.workers != 1 && params.obj && !includeImports && !params.addMain && !debugMap &&
+        !params.json.doOutput && !params.ddoc.doOutput && !params.vcg_ast &&
+        !params.cxxhdr.doOutput && !params.moduleDeps.buffer && !params.dihdr.doOutput &&
+        !params.timeTrace && !params.v.verbose && !params.v.templates && !params.makeDeps.doOutput)
+    {
+        import dmd.glue : planSplit;
+        import dmd.parallel : workerCountFor;
+        const n = workerCountFor(modules, driverParams.workers);
+        if (n >= 2)
+            workers = split(modules, n, planSplit(modules[], n));
+        if (workers.isChild)
+        {
+            import dmd.glue : outputPartSuffix;
+            outputPartSuffix = partSuffix(workers.index);
+        }
+        else if (workers.count)
+        {
+            /* Combine the workers' output parts; if the workers did not all succeed,
+             * this process generates the code itself
+             */
+            import dmd.glue : libraryFileName, oneObjectFileName, mergeLibraries;
+            const output = driverParams.lib ? libraryFileName(params.libname, params.objdir) :
+                           driverParams.oneobj ? oneObjectFileName(modules[]) : null;
+            if (output.length)
+            {
+                auto parts = partNames(output, workers.count);
+                if (workers.succeeded)
+                    workers.succeeded = driverParams.lib ? mergeLibraries(output, libmodules[], parts) :
+                                                           mergeObjects(output, parts);
+                removeParts(parts);
+            }
+        }
     }
 
     if (!workers.succeeded)

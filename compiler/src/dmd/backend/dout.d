@@ -69,6 +69,9 @@ void outthunk(Symbol* sthunk, Symbol* sfunc, uint p, tym_t thisty,
 }
 
 
+/// How many data symbols `outdata` has written
+public __gshared size_t dataSymbolsWritten;
+
 /***************************
  * Write out statically allocated data.
  * Params:
@@ -77,6 +80,7 @@ void outthunk(Symbol* sthunk, Symbol* sfunc, uint p, tym_t thisty,
 @trusted public
 void outdata(Symbol* s)
 {
+    ++dataSymbolsWritten;
     int seg;
     targ_size_t offset;
     int flags;
