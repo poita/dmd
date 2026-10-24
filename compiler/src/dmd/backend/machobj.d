@@ -381,6 +381,9 @@ Obj MachObj_init(OutBuffer* objbuf, const(char)* filename, const(char)* csegname
     machobj.externSymbols.reset();
     machobj.forwardedSymbols.reset();
 
+    // a common symbol of an earlier object file is an external one of this one
+    foreach (ref c; machobj.comdefs[])
+        symbol_reset(*c.sym);
     machobj.comdefs.setLength(SYM_TAB_INIT);       // reserve some space
     machobj.comdefs.reset();
 
