@@ -390,6 +390,7 @@ enum
     F3hiddenPtr      = 0x100_0000, // function has hidden pointer to return value
     F3safe           = 0x200_0000, // function is @safe
     Fhasframe        = 0x400_0000, // function has standard stack frame
+    Finlinecallee    = 0x800_0000, // may be inline expanded into the function being optimized
 }
 
 struct func_t

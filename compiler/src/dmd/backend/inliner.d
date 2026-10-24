@@ -315,8 +315,10 @@ private elem* tryInliningCall(elem* e)
     {   func_t* f = sfunc.Sfunc;
 
         /* Check to see if we inline expand the function, or queue  */
-        /* it to be output.                                         */
-        if ((f.Fflags & (Finline | Finlinenest)) == Finline)
+        /* it to be output. Only the functions the front end marks for */
+        /* the function being optimized are, so that what is inlined */
+        /* does not depend on the order the functions are compiled in */
+        if ((f.Fflags & (Finline | Finlinenest | Finlinecallee)) == (Finline | Finlinecallee))
             e = inlineCall(e,sfunc);
         else
             {   } //queue_func(sfunc);

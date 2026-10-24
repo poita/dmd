@@ -903,6 +903,236 @@ private void generatePlannedInstances(bool multiobj)
     }
 }
 
+/* The backend inline expands a function call only into a function compiled after the
+ * function called, whose optimized code it copies. So that what is inlined does not
+ * depend on the order the functions are compiled in, which in a split compilation
+ * depends on how they are split, a function `f` may only have inlined the functions
+ * `inlineCallees(f)` gives: those it calls directly that rank before it, a function's
+ * rank being the position of its outermost enclosing function among the members of
+ * the root modules (see `rankFunctions`), then its mangled name. They are compiled
+ * before `f` is, in any process compiling `f`: in a worker of a split compilation, a
+ * weak definition of a function another worker generates is so generated here too.
+ */
+
+/// The position of each function among the members of the root modules
+private __gshared uint[void*] functionPositions;
+
+/**************************************
+ * Rank the functions of the root modules for the backend inliner (see
+ * `inlineCallees`), by their position among the members of `modules`, the members of
+ * a template instance being where the instance is.
+ */
+public void rankFunctions(Module[] modules)
+{
+    import dmd.dsymbolsem : include;
+
+    uint position;
+    void walk(Dsymbols* members)
+    {
+        if (!members)
+            return;
+        foreach (s; *members)
+        {
+            if (auto fd = s.isFuncDeclaration())
+                functionPositions[cast(void*)fd] = ++position;
+            else if (auto ti = s.isTemplateInstance())
+            {
+                if (!isError(ti))
+                    walk(ti.members);
+            }
+            else if (s.isAttribDeclaration())
+                walk(include(s, null));
+            else if (auto sds = s.isScopeDsymbol())
+            {
+                if (!s.isTemplateDeclaration())
+                    walk(sds.members);
+            }
+        }
+    }
+    foreach (m; modules)
+        walk(m.members);
+}
+
+/// Returns: true if function `g` ranks before function `f` (see `inlineCallees`)
+private bool ranksBefore(FuncDeclaration g, FuncDeclaration f)
+{
+    import dmd.mangle : mangleExact;
+
+    static uint position(FuncDeclaration fd)
+    {
+        if (auto p = cast(void*)frameRoot(fd) in functionPositions)
+            return *p;
+        return uint.max;
+    }
+    const pg = position(g), pf = position(f);
+    if (pg != pf)
+        return pg < pf;
+    return strcmp(mangleExact(g), mangleExact(f)) < 0;
+}
+
+/* Returns: true if the code of `fd` may be a single basic block once optimized, which
+ * the backend inlines, and is small enough to compile again for that
+ */
+private bool backendInlineShape(FuncDeclaration fd)
+{
+    import dmd.visitor : StoppableVisitor;
+    import dmd.visitor.postorder : walkPostorder;
+
+    enum maxStatements = 100;
+    extern (C++) final class Finder : StoppableVisitor
+    {
+        alias visit = typeof(super).visit;
+        uint statements;
+        extern (D) this() scope {}
+        override void visit(Statement s)
+        {
+            if (++statements > maxStatements)
+                stop = true;
+        }
+        override void visit(TryCatchStatement s) { stop = true; }
+        override void visit(TryFinallyStatement s) { stop = true; }
+        override void visit(ScopeGuardStatement s) { stop = true; }
+        override void visit(SynchronizedStatement s) { stop = true; }
+        override void visit(AsmStatement s) { stop = true; }
+    }
+    scope Finder v = new Finder();
+    if (walkPostorder(fd.fbody, v))
+        return false;
+
+    /* A function compiled for inlining where it would not otherwise be duplicates its
+     * code, which must then not define what it declares: data, whose address tells it
+     * apart, nor functions or aggregates
+     */
+    extern (C++) final class Declarations : StoppableVisitor
+    {
+        alias visit = typeof(super).visit;
+        extern (D) this() scope {}
+        override void visit(Expression e) {}
+        override void visit(FuncExp e) { stop = true; }
+        override void visit(DeclarationExp e)
+        {
+            auto d = e.declaration;
+            if (auto vd = d.isVarDeclaration())
+            {
+                if (vd.isDataseg())
+                    stop = true;
+            }
+            else if (d.isFuncDeclaration() || d.isAggregateDeclaration() || d.isAttribDeclaration())
+                stop = true;
+        }
+    }
+    import dmd.visitor.foreachvar : foreachExpAndVar;
+    scope Declarations d = new Declarations();
+    bool declares;
+    foreachExpAndVar(fd.fbody, (Expression e) {
+        if (!declares && walkPostorder(e, d))
+            declares = true;
+    }, (VarDeclaration vd) {
+        if (vd.isDataseg())
+            declares = true;
+    });
+    return !declares;
+}
+
+/// Returns: true if the backend may inline function `g` into function `f`, which
+/// calls it (see `inlineCallees`)
+private bool backendInlinable(FuncDeclaration g, FuncDeclaration f)
+{
+    import dmd.templatesem : needsCodegen;
+
+    if (g is f || !g.fbody || g.hasSemantic3Errors || g.skipCodegen || g.isNaked ||
+        g.semanticRun < PASS.semantic3done || g.semanticRun == PASS.semanticdone ||
+        g.isNested() || g.inlinedNestedCallees || inNonRootFunction(g) || registersWithModule(g) ||
+        g.isUnitTestDeclaration())
+        return false;
+    if (auto ti = g.isInstantiated())
+    {
+        if (isError(ti) || !ti.needsCodegen())
+            return false;
+    }
+    else if (target.os != Target.OS.OSX && g.getModule() !is f.getModule())
+        return false;   // only on Mach-O is every function a weak definition
+    if (!(toSymbol(g).Sfunc.Fflags & Finline) || !ranksBefore(g, f))
+        return false;
+    return backendInlineShape(g);
+}
+
+/// Returns: the functions the backend may inline into `f`, which are compiled before it
+private FuncDeclaration[] inlineCallees(FuncDeclaration f)
+{
+    import dmd.visitor : StoppableVisitor;
+    import dmd.visitor.foreachvar : foreachExpAndVar;
+    import dmd.visitor.postorder : walkPostorder;
+    import dmd.init : ExpInitializer;
+
+    if (!f.fbody)
+        return null;
+    FuncDeclaration[] callees;
+    bool[void*] seen;
+
+    extern (C++) final class Collector : StoppableVisitor
+    {
+        alias visit = typeof(super).visit;
+        extern (D) void delegate(Expression) walk;
+        extern (D) void delegate(VarDeclaration) var;
+        extern (D) void delegate(FuncDeclaration) call;
+        extern (D) this() scope {}
+        override void visit(Expression e) {}
+        override void visit(CallExp e)
+        {
+            if (e.f && (!e.f.isVirtual() || e.directcall))
+                call(e.f);
+        }
+        override void visit(NewExp e)
+        {
+            if (e.member)
+                call(e.member);     // the constructor
+            walk(e.lowering);
+        }
+        override void visit(ArrayLiteralExp e) { walk(e.lowering); }
+        override void visit(AssocArrayLiteralExp e) { walk(e.lowering); }
+        override void visit(CastExp e) { walk(e.lowering); }
+        override void visit(LoweredAssignExp e) { walk(e.lowering); }
+        override void visit(ConstructExp e) { walk(e.lowering); }
+        override void visit(DeclarationExp e)
+        {
+            if (auto vd = e.declaration.isVarDeclaration())
+                var(vd);
+        }
+    }
+    scope Collector c = new Collector();
+    void walkExp(Expression e)
+    {
+        if (e)
+            walkPostorder(e, c);
+    }
+    void walkVar(VarDeclaration vd)
+    {
+        if (vd._init)
+            if (auto ei = vd._init.isExpInitializer())
+                walkExp(ei.exp);
+        walkExp(vd.edtor);
+    }
+    void call(FuncDeclaration g)
+    {
+        if (cast(void*)g in seen)
+            return;
+        seen[cast(void*)g] = true;
+        if (backendInlinable(g, f))
+            callees ~= g;
+    }
+    c.walk = &walkExp;
+    c.var = &walkVar;
+    c.call = &call;
+    foreachExpAndVar(f.fbody, &walkExp, &walkVar);
+    return callees;
+}
+
+/* In a worker of a split compilation: the function generated here whatever worker the
+ * split has generate it, as the function being generated may have it inlined
+ */
+private __gshared FuncDeclaration generatedForInlining;
+
 /* Generate the code of `fp` now, as the code of the function being generated depends
  * on the layout of its frame. In a worker of a split compilation, if another worker
  * generates `fp`, the split is given up.
@@ -986,7 +1216,7 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
 
     SplitGroup group;
     const(char)[] splitName;
-    const split = inSplitWorker();
+    const split = inSplitWorker() && fd !is generatedForInlining;
     if (split)
     {
         group = functionGroup(fd);
@@ -1149,6 +1379,18 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
     {
         if (entryPointFunctions(objmod, fd))
             s.Sclass = SC.global;
+    }
+
+    // the functions the backend may inline into this one are compiled first
+    FuncDeclaration[] inlined = driverParams.optimize ? inlineCallees(fd) : null;
+    foreach (g; inlined)
+    {
+        if (g.semanticRun >= PASS.obj)
+            continue;
+        auto saved = generatedForInlining;
+        generatedForInlining = g;
+        toObjFile(g, false);
+        generatedForInlining = saved;
     }
 
     symtab_t* symtabsave = cstate.CSpsymtab;
@@ -1569,7 +1811,11 @@ void FuncDeclaration_toObjFile(FuncDeclaration fd, bool multiobj)
         return;
     }
 
+    foreach (g; inlined)
+        toSymbol(g).Sfunc.Fflags |= Finlinecallee;
     writefunc(s); // hand off to backend
+    foreach (g; inlined)
+        toSymbol(g).Sfunc.Fflags &= ~Finlinecallee;
 
     buildCapture(fd);
 

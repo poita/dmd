@@ -804,6 +804,11 @@ private int tryMain(const(char)[][] argv, out Param params)
             params.objfiles.push(mainModule.objfile.toChars());
     }
 
+    {
+        import dmd.glue : rankFunctions;
+        rankFunctions(modules[]);
+    }
+
     /* Split the code generation of the root modules across worker processes, which
      * start from the state of this process once everything but code generation is
      * done. On Mach-O, the parts of one object file are combined with `ld -r`, which
