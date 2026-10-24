@@ -3405,15 +3405,23 @@ void MachObj_write_pointerRef(Symbol* s, uint off)
 /******************************************
  * Determine if an AArch64 ADRP/PAGEOFF12 reference to `s` goes through the GOT.
  * The code generator must then use LDR (not ADD) for the PAGEOFF12 instruction.
+ * A symbol visible outside the object file is reached through the GOT whether or not
+ * it has been defined in the object file yet, so that the code referring to it does
+ * not depend on the order the symbols are written in, nor on which object file of a
+ * split compilation defines it; the linker turns the load from the GOT into an ADD
+ * when the symbol is in the image it links.
  */
 @trusted
 bool MachObj_isGOTRef(const Symbol* s)
 {
     switch (s.Sclass)
     {
-        case SC.extern_:
+        case SC.global:
         case SC.comdat:
         case SC.comdef:
+            return true;
+
+        case SC.extern_:
         case SC.static_:
             return s.Sfl == FL.unde ||   // special case for __chkstk_darwin
                    s.Sfl == FL.extern_ ||
