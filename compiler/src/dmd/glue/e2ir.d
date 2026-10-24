@@ -952,10 +952,12 @@ elem* toElem(Expression e, ref IRState irs)
         }
         else if (se.op == EXP.variable)
         {
-            if (sytab[s.Sclass] & SCDATA && s.Sfl != FL.func && target.isAArch64)
+            if (sytab[s.Sclass] & SCDATA && !tyfunc(s.ty()) && target.isAArch64)
             {
                 /* AArch64 does not have an LEA instruction,
-                 * so access data segment data via a pointer
+                 * so access data segment data via a pointer. A function is told by
+                 * its type, as the symbol of one written to an earlier object file is
+                 * an external symbol, no longer FL.func.
                  */
                 e = el_ptr(s);
                 e = el_una(OPind,s.Stype.Tty,e); // e = * & s
