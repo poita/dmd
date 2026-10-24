@@ -208,7 +208,8 @@ public bool mergeLibraries(const(char)[] libfile, const(char)*[] libmodules, con
         library.addObject(p, null);
     if (global.errors)
         return false;
-    auto tmpname = libfile ~ ".tmp\0";
+    import dmd.parallel : mergeTemporary;
+    auto tmpname = mergeTemporary(libfile) ~ "\0";
     auto libbuf = OutBuffer(tmpname.ptr);
     library.writeLibToBuffer(libbuf);
     return libbuf.moveToFile(libfile);

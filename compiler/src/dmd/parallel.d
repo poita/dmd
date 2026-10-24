@@ -32,7 +32,7 @@ version (Posix)
     import core.sys.posix.sys.mman : mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE;
     import core.sys.posix.sys.types : pid_t;
     import core.sys.posix.sys.wait : waitpid, WIFEXITED, WEXITSTATUS;
-    import core.sys.posix.unistd : dup2, fork, _exit, sysconf, execvp, _SC_NPROCESSORS_ONLN;
+    import core.sys.posix.unistd : dup2, fork, _exit, getpid, sysconf, execvp, _SC_NPROCESSORS_ONLN;
 }
 
 /**************************************
@@ -225,12 +225,26 @@ struct Workers
     bool isChild() const nothrow { return index >= 0; }
 }
 
+/// the process id of the original process of the split, which names the files it
+/// and its workers write beside the output, so that no other compilation writing
+/// the same output reads or replaces them
+private __gshared int splitOwner;
+
 /// Returns: the suffix added to the output file names of worker `index`
 const(char)[] partSuffix(int index)
 {
-    char[16] buf = void;
-    const n = snprintf(buf.ptr, buf.length, ".part%d", index);
+    char[32] buf = void;
+    const n = snprintf(buf.ptr, buf.length, ".%d.part%d", splitOwner, index);
     return buf[0 .. n].idup;
+}
+
+/// Returns: the name of the temporary file the original process of the split writes
+/// `file` to before renaming it to `file`
+const(char)[] mergeTemporary(const(char)[] file)
+{
+    char[32] buf = void;
+    const n = snprintf(buf.ptr, buf.length, ".%d.tmp", splitOwner);
+    return file ~ buf[0 .. n];
 }
 
 version (Posix)
@@ -318,6 +332,7 @@ Workers split(ref Modules modules, uint requested)
         if (next == MAP_FAILED)
             return w;
         w.next = cast(shared(size_t)*)next;
+        splitOwner = getpid();
         void* c = mmap(null, NameTable.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
         if (c != MAP_FAILED)
             claims = cast(NameTable*)c;
@@ -593,8 +608,9 @@ bool mergeObjects(const(char)[] objfile, const(char)[][] parts)
         const(char)*[] argv;
         argv ~= "ld";
         argv ~= "-r";
+        const tmpfile = mergeTemporary(objfile);
         argv ~= "-o";
-        argv ~= toCString(objfile);
+        argv ~= toCString(tmpfile);
         foreach (p; parts)
             argv ~= toCString(p);
         argv ~= null;
@@ -610,7 +626,12 @@ bool mergeObjects(const(char)[] objfile, const(char)[][] parts)
             _exit(127);
         }
         int status;
-        return waitpid(pid, &status, 0) != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        if (waitpid(pid, &status, 0) == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        {
+            remove(toCString(tmpfile));
+            return false;
+        }
+        return rename(toCString(tmpfile), toCString(objfile)) == 0;
     }
     else
         return false;
