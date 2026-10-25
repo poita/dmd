@@ -1065,14 +1065,16 @@ private bool backendInlineShape(FuncDeclaration fd)
 private __gshared bool[void*] inlineShapes;
 
 /// Returns: true if the backend may inline function `g` into function `f`, which
-/// calls it (see `inlineCallees`)
+/// calls it (see `inlineCallees`). A function nested in a function, directly or as a
+/// member of a nested aggregate, reaches the function's frame at offsets known only
+/// once that function is compiled, so it is not compiled ahead to be inlined.
 private bool backendInlinable(FuncDeclaration g, FuncDeclaration f)
 {
     import dmd.templatesem : needsCodegen;
 
     if (g is f || !g.fbody || g.hasSemantic3Errors || g.skipCodegen || g.isNaked ||
         g.semanticRun < PASS.semantic3done || g.semanticRun == PASS.semanticdone ||
-        g.isNested() || g.inlinedNestedCallees || inNonRootFunction(g) || registersWithModule(g) ||
+        frameRoot(g) !is g || g.inlinedNestedCallees || inNonRootFunction(g) || registersWithModule(g) ||
         g.isUnitTestDeclaration())
         return false;
     if (auto ti = g.isInstantiated())
