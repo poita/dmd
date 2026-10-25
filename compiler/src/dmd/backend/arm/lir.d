@@ -7393,11 +7393,20 @@ private void numberValues()
         h = h * 131 + i.b;
         h = h * 131 + i.c;
         h = h * 131 + cast(size_t)i.imm;
-        // a symbol by its name, not its address, so which instructions the table
-        // keeps does not change from one compilation to the next
-        if (i.sym)
-            for (const(char)* c = i.sym.Sident.ptr; *c; ++c)
-                h = h * 31 + *c;
+        /* a symbol by what tells it apart in the function, not by its address, so
+         * which instructions the table keeps does not change from one compilation
+         * to the next: a local by its number in the function, a symbol the compiler
+         * generates by none, as its name is numbered in the order the compiler
+         * process generates them, any other by its name
+         */
+        if (const s = i.sym)
+        {
+            if (sytab[s.Sclass] & SCSS)
+                h = h * 131 + s.Ssymnum;
+            else if (!(s.Sflags & SFLartifical))
+                for (const(char)* c = s.Sident.ptr; *c; ++c)
+                    h = h * 31 + *c;
+        }
         h = h * 131 + i.flags * 7 + i.cond;
         // the high bits of the product depend on all of h, so the slots spread evenly
         return (h * 0x9E3779B97F4A7C15UL) >> 40;
