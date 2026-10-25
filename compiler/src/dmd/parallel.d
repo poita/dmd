@@ -310,7 +310,8 @@ uint workerCountFor(ref Modules modules, uint requested)
  * worker gave it up, why.
  * Params:
  *      modules = the root modules; in a worker, narrowed to those it generates
- *      n = the number of workers, from `workerCountFor`
+ *      n = the number of workers, from `workerCountFor` and `dmd.glue.planSplit`;
+ *          less than 2 not to split
  *      assign = the worker of each module, from `dmd.glue.planSplit`
  * Returns:
  *      the split
@@ -322,6 +323,12 @@ Workers split(ref Modules modules, uint n, uint[] assign)
     {
         import core.atomic : atomicLoad, atomicStore;
         import core.stdc.errno : errno, EINTR;
+
+        if (n < 2)
+        {
+            clearPlan();
+            return w;
+        }
 
         void* r = mmap(null, Rendezvous.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
         void* t = mmap(null, NameTable.sizeof, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);

@@ -824,9 +824,12 @@ private int tryMain(const(char)[][] argv, out Param params)
     {
         import dmd.glue : planSplit;
         import dmd.parallel : workerCountFor;
-        const n = workerCountFor(modules, driverParams.workers);
+        uint n = workerCountFor(modules, driverParams.workers);
         if (n >= 2)
-            workers = split(modules, n, planSplit(modules[], n));
+        {
+            auto assign = planSplit(modules[], n);
+            workers = split(modules, n, assign);
+        }
         if (workers.isChild)
         {
             import dmd.glue : outputPartSuffix;
