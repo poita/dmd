@@ -735,8 +735,6 @@ Symbol* toThunkSymbol(FuncDeclaration fd, int offset)
     if (retStyle(fd.type.isTypeFunction(), fd.needThis()) == RET.stack)
         s.Sfunc.Fflags |= F3hiddenPtr;
 
-    s.Sfunc.Fflags &= ~Finline;  // thunks are not real functions, don't inline them
-
     __gshared int tmpnum;
     const nameLen = 6 + tmpnum.sizeof * 3 + 1;
     char[nameLen] name = void;
