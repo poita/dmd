@@ -1061,6 +1061,9 @@ private bool backendInlineShape(FuncDeclaration fd)
     return !declares;
 }
 
+/// Whether each function examined has `backendInlineShape`
+private __gshared bool[void*] inlineShapes;
+
 /// Returns: true if the backend may inline function `g` into function `f`, which
 /// calls it (see `inlineCallees`)
 private bool backendInlinable(FuncDeclaration g, FuncDeclaration f)
@@ -1081,7 +1084,9 @@ private bool backendInlinable(FuncDeclaration g, FuncDeclaration f)
         return false;   // only on Mach-O is every function a weak definition
     if (!(toSymbol(g).Sfunc.Fflags & Finline) || !ranksBefore(g, f))
         return false;
-    return backendInlineShape(g);
+    if (auto p = cast(void*)g in inlineShapes)
+        return *p;
+    return inlineShapes[cast(void*)g] = backendInlineShape(g);
 }
 
 /// Returns: the functions the backend may inline into `f`, which are compiled before it

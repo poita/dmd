@@ -804,6 +804,7 @@ private int tryMain(const(char)[][] argv, out Param params)
             params.objfiles.push(mainModule.objfile.toChars());
     }
 
+    if (params.obj && driverParams.optimize)
     {
         import dmd.glue : rankFunctions;
         rankFunctions(modules[]);
