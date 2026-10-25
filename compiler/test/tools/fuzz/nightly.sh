@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs the program and ABI fuzzers over a range of seeds that changes every
-# day, minimizing failing programs, and prints a summary.
+# day, minimizing failing programs, and the split compilation check on random
+# multi-module programs, and prints a summary.
 #
 # Usage: nightly.sh [COUNT] [extra fuzz.py options]
 #   COUNT  seeds per fuzzer (default 300)
@@ -22,6 +23,12 @@ status=0
 echo "seeds $from-$to, work $work" | tee "$log"
 python3 "$here/fuzz.py" prog "$from-$to" -j "$jobs" --work "$work" --minimize "$@" >>"$log" 2>&1 || status=1
 python3 "$here/fuzz.py" abi "$from-$to" -j "$jobs" --work "$work" "$@" >>"$log" 2>&1 || status=1
+# split compilations against unsplit ones, on a thirtieth as many seeds, as each
+# program is compiled some forty times
+scount=$(( count / 30 > 0 ? count / 30 : 1 ))
+sfrom=$(( (day % 10000) * scount + 1 ))
+sto=$(( sfrom + scount - 1 ))
+python3 "$here/splitfuzz.py" "$sfrom-$sto" -j "$jobs" --work "$work" >>"$log" 2>&1 || status=1
 cat "$log"
 echo "log: $log, failures in $work/fail"
 exit $status

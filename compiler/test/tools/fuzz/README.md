@@ -12,7 +12,8 @@ anything that is allowed to vary.
 | `fuzz.py prog SEEDS` | compiles each program with ldc2 (the reference) and with dmd in each configuration of `PROG_CONFIGS` (no flags, `-inline`, `-O` with the new and the old AArch64 code generator, `-O -inline`, `-O -inline -release`, `-boundscheck=off`), runs them and compares the output |
 | `fuzz.py bounds SEEDS` | the same for the programs of `boundsfuzz.py`, without the configurations that turn the bounds checks off |
 | `fuzz.py abi SEEDS` | compiles each ABI test with dmd without `-O`, with `-O` by the old code generator (`DMD_NEWCG=0`) and by the new one, with `-O -inline -release`, and with the C compiler, links every caller with every callee and compares with the expected output |
-| `nightly.sh` | runs both over a seed range that changes every day, minimizing failing programs |
+| `splitfuzz.py SEEDS` | writes a program of several modules, each a `progfuzz.py` program, sharing the instances of a module of templates, and checks it with `../splitcheck.py`: compiled with `-j=1` and with `-j=2,3,8` to an object file and to a library, with and without `-O -inline -release`, compared symbol by symbol and byte for byte across repeated compilations, and run from the `-j=1` and `-j=3` object files |
+| `nightly.sh` | runs the program and ABI fuzzers over a seed range that changes every day, minimizing failing programs, and `splitfuzz.py` over a thirtieth as many seeds |
 
 ## Use
 
