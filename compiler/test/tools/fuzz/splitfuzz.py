@@ -83,7 +83,7 @@ def check(seed, args):
         # the program runs the same with the code of either
         outputs = []
         for j in ('1', '3'):
-            obj = 'p%s.o' % j
+            obj = 'modules%s.o' % j
             status, out = run([args.dmd, '-j=' + j, '-c', '-of=' + obj] + flags + files, env=env, cwd=directory)
             if status == 0:
                 exe = os.path.join(directory, 'p' + j)
