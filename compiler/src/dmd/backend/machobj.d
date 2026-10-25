@@ -3419,13 +3419,12 @@ bool MachObj_isGOTRef(const Symbol* s)
         case SC.global:
         case SC.comdat:
         case SC.comdef:
+        case SC.extern_:
             return true;
 
-        case SC.extern_:
         case SC.static_:
             return s.Sfl == FL.unde ||   // special case for __chkstk_darwin
                    s.Sfl == FL.extern_ ||
-                   (s.Sclass == SC.extern_ && s.Sfl == FL.func) ||
                    s.Sfl == FL.tlsdata;
         default:
             return false;

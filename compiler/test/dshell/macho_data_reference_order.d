@@ -31,5 +31,37 @@ int main()
         writefln("%s of the %s references to x go through the GOT", got, all);
         return 1;
     }
+
+    /* With -lib, a template instance's zero-initialized variable is a common symbol
+     * of the instance's object file, an external one of the object files written
+     * after it
+     */
+    std.file.write(Vars.OUTPUT_BASE ~ "/s.d", q{
+        module s;
+        template Reg(T)
+        {
+            __gshared int count;
+            shared static this() { ++count; }
+        }
+    });
+    string files = " $OUTPUT_BASE/s.d";
+    foreach (m; ["m0", "m1", "m2"])
+    {
+        std.file.write(Vars.OUTPUT_BASE ~ "/" ~ m ~ ".d",
+            "module " ~ m ~ ";\nimport s;\nint use_" ~ m ~ "() { return Reg!int.count; }\n");
+        files ~= " $OUTPUT_BASE/" ~ m ~ ".d";
+    }
+    run("$DMD -m$MODEL -conf= -O -lib -I$OUTPUT_BASE -of=$OUTPUT_BASE/b$LIBEXT" ~ files);
+    const rl = execute(["otool", "-rv", Vars.OUTPUT_BASE ~ "/b" ~ Vars.LIBEXT]);
+    assert(rl.status == 0, rl.output);
+    auto refs = rl.output.splitter('\n').filter!(l => l.canFind("__D1s__T3RegTiZ5counti"));
+    const gotRefs = refs.save.count!(l => l.canFind("GOTLDP"));
+    const allRefs = refs.count;
+    if (allRefs != 8 || gotRefs != 8)
+    {
+        writeln(rl.output);
+        writefln("%s of the %s references to Reg!int.count go through the GOT", gotRefs, allRefs);
+        return 1;
+    }
     return 0;
 }
