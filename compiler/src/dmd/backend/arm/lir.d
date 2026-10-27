@@ -387,6 +387,8 @@ bool lirCodegen(ref CGstate cg)
         if (!env!"DMD_NEWCG_NOIFCONV")
         {
             removeConstantBoundsChecks();
+            if (!env!"DMD_NEWCG_NODOMTEST")
+                foldDominatedTests(false);
             removeUnreachable();
             ifConvertBranches();
         }
@@ -408,6 +410,12 @@ bool lirCodegen(ref CGstate cg)
         fuseMultiplyAdds();
         fuseCompareChains();
         foldSelectOperations();
+        if (!env!"DMD_NEWCG_NODOMTEST")
+        {
+            foldDominatedTests(true);
+            removeUnreachable();
+            removeDead();
+        }
     }
     if (failed)
     {
@@ -14245,6 +14253,573 @@ private void threadJumps()
         applyInserts(inserts);
         if (!any)
             break;
+    }
+}
+
+/******************************* Dominating tests ******************************/
+
+/* A comparison of registers or of a register with a constant, as tested by a
+ * conditional branch: kind 1 is cmp a, b; 2 cmpi a, imm (cbz being cmpi a, 0);
+ * 3 fcmp a, b; 4 fcmpz a
+ */
+private struct Test
+{
+    ubyte kind;
+    ubyte sz;
+    Reg a, b;
+    long imm;
+}
+
+/* That cond holds (or does not) of the comparison t, where a branch on it leads */
+private struct Fact
+{
+    Test t;
+    ubyte cond;
+    bool holds;
+    bool global;    // of registers defined once, so true wherever the branch dominates
+}
+
+/* Whether cond holds of the flags nzcv (N bit 3 .. V bit 0)
+ */
+private bool condHolds(uint cond, uint nzcv)
+{
+    const n = (nzcv >> 3) & 1, z = (nzcv >> 2) & 1, c = (nzcv >> 1) & 1, v = nzcv & 1;
+    bool r;
+    switch (cond & ~1)
+    {
+        case COND.eq: r = z == 1; break;
+        case COND.cs: r = c == 1; break;
+        case COND.mi: r = n == 1; break;
+        case COND.vs: r = v == 1; break;
+        case COND.hi: r = c == 1 && z == 0; break;
+        case COND.ge: r = n == v; break;
+        case COND.gt: r = z == 0 && n == v; break;
+        default: return true;
+    }
+    return (cond & 1) ? !r : r;
+}
+
+/* The flags of the outcomes of a comparison, all that matter for the conditions an
+ * outcome decides: of integers, where they are equal, and less or greater as signed
+ * and as unsigned values (N and V are not decided by them, so conditions on them alone
+ * are never reasoned about); of floats, less, equal, greater and unordered, exactly.
+ * The second set of flags is of the comparison the other way round.
+ */
+private immutable ubyte[2][5] intOutcomes = [
+    [0b0110, 0b0110],   // equal
+    [0b1000, 0b0010],   // less signed, less unsigned
+    [0b1010, 0b0000],   // less signed, greater unsigned
+    [0b0000, 0b1010],   // greater signed, less unsigned
+    [0b0010, 0b1000],   // greater signed, greater unsigned
+];
+private immutable ubyte[2][4] floatOutcomes = [
+    [0b1000, 0b0010],   // less
+    [0b0110, 0b0110],   // equal
+    [0b0010, 0b1000],   // greater
+    [0b0011, 0b0011],   // unordered
+];
+
+/* Where cond holds of the comparison of a register with the constant v of sz bytes,
+ * the range of its unsigned value, [ul, uh], and of its signed value, [sl, sh];
+ * false if that is not known or holds of no value
+ */
+private bool constRange(uint cond, long v, uint sz, out ulong ul, out ulong uh, out long sl, out long sh)
+{
+    const ulong umax = sz == 4 ? uint.max : ulong.max;
+    const long smin = sz == 4 ? int.min : long.min;
+    const long smax = sz == 4 ? int.max : long.max;
+    const ulong uv = cast(ulong)v & umax;
+    const long sv = sz == 4 ? cast(int)v : v;
+    ul = 0; uh = umax; sl = smin; sh = smax;
+    switch (cond)
+    {
+        case COND.eq: ul = uh = uv; sl = sh = sv; break;
+        case COND.cc: if (uv == 0) return false; uh = uv - 1; break;
+        case COND.ls: uh = uv; break;
+        case COND.hi: if (uv == umax) return false; ul = uv + 1; break;
+        case COND.cs: ul = uv; break;
+        case COND.lt: if (sv == smin) return false; sh = sv - 1; break;
+        case COND.le: sh = sv; break;
+        case COND.gt: if (sv == smax) return false; sl = sv + 1; break;
+        case COND.ge: sl = sv; break;
+        default: return false;
+    }
+    // what is in both ranges, when the one is of values the other holds as they are
+    if (uh <= cast(ulong)smax)
+    {
+        if (cast(long)ul > sl) sl = cast(long)ul;
+        if (cast(long)uh < sh) sh = cast(long)uh;
+    }
+    if (sl >= 0)
+    {
+        if (cast(ulong)sl > ul) ul = cast(ulong)sl;
+        if (cast(ulong)sh < uh) uh = cast(ulong)sh;
+    }
+    return ul <= uh && sl <= sh;
+}
+
+/* Whether cond holds of the comparison t where fact f does: 1 or 0, or -1 if f does
+ * not decide it
+ */
+private int decideTest(ref const Fact f, ref const Test t, uint cond)
+{
+    if (f.t.kind != t.kind || f.t.sz != t.sz || f.t.a != t.a && !(t.kind == 1 || t.kind == 3))
+        return -1;
+    const flt = t.kind >= 3;
+    if (!flt && ((f.cond & ~1) == COND.mi || (f.cond & ~1) == COND.vs || (cond & ~1) == COND.mi ||
+                 (cond & ~1) == COND.vs || f.cond >= COND.al || cond >= COND.al))
+        return -1;
+    int way = -1;   // 0 the same comparison, 1 the other way round
+    if (f.t.a == t.a && (t.kind == 2 ? f.t.imm == t.imm : t.kind == 4 || f.t.b == t.b))
+        way = 0;
+    else if ((t.kind == 1 || t.kind == 3) && f.t.a == t.b && f.t.b == t.a)
+        way = 1;
+    if (way >= 0)
+    {
+        int r = -1;
+        foreach (ref o; flt ? floatOutcomes[] : intOutcomes[])
+        {
+            if (condHolds(f.cond, o[0]) != f.holds)
+                continue;
+            const h = condHolds(cond, o[way]);
+            if (r >= 0 && r != h)
+                return -1;
+            r = h;
+        }
+        return r;
+    }
+    if (t.kind != 2)
+        return -1;
+    // a register compared with another constant, through the range the fact gives it
+    ulong ul, uh;
+    long sl, sh;
+    if (!constRange(f.holds ? f.cond : f.cond ^ 1, f.t.imm, t.sz, ul, uh, sl, sh))
+        return -1;
+    const ulong umax = t.sz == 4 ? uint.max : ulong.max;
+    const ulong uw = cast(ulong)t.imm & umax;
+    const long sw = t.sz == 4 ? cast(int)t.imm : t.imm;
+    int r = -1;
+    switch (cond & ~1)
+    {
+        case COND.eq:
+            if (ul == uh && ul == uw)
+                r = 1;
+            else if (uw < ul || uw > uh || sw < sl || sw > sh)
+                r = 0;
+            break;
+        case COND.cs:
+            if (ul >= uw) r = 1; else if (uh < uw) r = 0;
+            break;
+        case COND.hi:
+            if (ul > uw) r = 1; else if (uh <= uw) r = 0;
+            break;
+        case COND.ge:
+            if (sl >= sw) r = 1; else if (sh < sw) r = 0;
+            break;
+        case COND.gt:
+            if (sl > sw) r = 1; else if (sh <= sw) r = 0;
+            break;
+        default:
+            return -1;
+    }
+    if (r >= 0 && (cond & 1))
+        r = !r;
+    return r;
+}
+
+/* A test that the tests leading to it decide is a jump or nothing: where a branch on
+ * a comparison goes, what it found holds until the registers compared change, and in
+ * all the code the branch dominates for registers defined once. A comparison that
+ * remains, the same as the one whose branch is all that leads to it in the block, is
+ * not made again when repeats is set, the flags being as that one left them; that is
+ * done last, as other passes take a branch to follow the comparison before it.
+ */
+@trusted
+private void foldDominatedTests(bool repeats)
+{
+    static bool readsFlags(ref const LIns i)
+    {
+        return i.op == LOp.bcond || i.op == LOp.cset || i.op == LOp.csel || i.op == LOp.fcsel ||
+            i.op == LOp.ccmp || i.op == LOp.ccmpi;
+    }
+    // what may change the flags, as emitted
+    static bool setsFlags(ref const LIns i)
+    {
+        return i.op == LOp.cmp || i.op == LOp.cmpi || i.op == LOp.tsti || i.op == LOp.fcmp ||
+            i.op == LOp.fcmpz || i.op == LOp.ccmp || i.op == LOp.ccmpi || i.op == LOp.call ||
+            i.op == LOp.tlv || i.op == LOp.atomic || i.op == LOp.brk || i.op == LOp.cbz && i.imm;
+    }
+
+    buildSegments();
+    const ns = segStart.length - 1;
+    if (ns < 2)
+        return;
+    Barray!uint psuccStart, psucc, ppredStart, ppreds;
+    Barray!uint ndefs, defAt, rpo, rpoNum, idom, stack, next;
+    Barray!Fact facts;
+    Barray!uint factStart, factEnd;
+    Barray!bool seen, changedBlock;
+    scope (exit)
+    {
+        psuccStart.dtor(); psucc.dtor(); ppredStart.dtor(); ppreds.dtor();
+        ndefs.dtor(); defAt.dtor(); rpo.dtor(); rpoNum.dtor(); idom.dtor(); stack.dtor(); next.dtor();
+        facts.dtor(); factStart.dtor(); factEnd.dtor(); seen.dtor(); changedBlock.dtor();
+    }
+    physicalFlow(psuccStart, psucc, ppredStart, ppreds);
+
+    ndefs.setLength(vinfo.length);
+    ndefs[][] = 0;
+    defAt.setLength(vinfo.length);
+    foreach (n, ref i; ins[])
+        if (i.d && !isPhys(i.d))
+        {
+            ++ndefs[i.d - firstVreg];
+            defAt[i.d - firstVreg] = cast(uint)n;
+        }
+    // the register r is a copy of, through copies of registers defined once that are the only definitions
+    Reg root(Reg r, uint sz)
+    {
+        foreach (_; 0 .. 8)
+        {
+            if (!r || isPhys(r) || ndefs[r - firstVreg] != 1)
+                break;
+            const LIns* d = &ins[defAt[r - firstVreg]];
+            if (d.op != LOp.copy || !d.a || isPhys(d.a) || ndefs[d.a - firstVreg] != 1 || d.sz < sz ||
+                d.flags & F.condDef || rcOf(d.a) != rcOf(r))
+                break;
+            r = d.a;
+        }
+        return r;
+    }
+    bool once(Reg r) { return !r || !isPhys(r) && ndefs[r - firstVreg] == 1; }
+
+    // the test a segment ends in: the comparison, the branch on it, its condition, and where it is
+    bool endTest(uint si, out Test t, out uint cond, out uint at, out uint brAt)
+    {
+        const end = segEnd(si);
+        if (end <= segStart[si])
+            return false;
+        const LIns* br = &ins[end - 1];
+        brAt = end - 1;
+        if (br.op == LOp.cbz)
+        {
+            if (br.imm || !br.a || isPhys(br.a) || br.sz != 4 && br.sz != 8)
+                return false;
+            t.kind = 2;
+            t.sz = br.sz;
+            t.a = root(br.a, br.sz);
+            t.imm = 0;
+            cond = br.cond;
+            at = uint.max;
+            return true;
+        }
+        if (br.op != LOp.bcond || br.cond >= COND.al)
+            return false;
+        uint k = end - 1;
+        while (k > segStart[si] && ins[k - 1].op == LOp.nop)
+            --k;
+        if (k == segStart[si])
+            return false;
+        const LIns* c = &ins[k - 1];
+        switch (c.op)
+        {
+            case LOp.cmp: t.kind = 1; break;
+            case LOp.cmpi: t.kind = 2; break;
+            case LOp.fcmp: t.kind = 3; break;
+            case LOp.fcmpz: t.kind = 4; break;
+            default: return false;
+        }
+        if (!c.a || isPhys(c.a) || (t.kind == 1 || t.kind == 3) && (!c.b || isPhys(c.b)))
+            return false;
+        if (t.kind <= 2 && c.sz != 4 && c.sz != 8)
+            return false;
+        t.sz = c.sz;
+        t.a = root(c.a, c.sz);
+        t.b = t.kind == 1 || t.kind == 3 ? root(c.b, c.sz) : noReg;
+        t.imm = t.kind == 2 ? c.imm : 0;
+        // a register compared with one only ever set to a constant is compared with the constant
+        if (t.kind == 1 && once(t.b))
+        {
+            const LIns* m = &ins[defAt[t.b - firstVreg]];
+            if (m.op == LOp.movi)
+            {
+                t.kind = 2;
+                t.imm = m.sz == 4 ? cast(uint)m.imm : m.imm;
+                t.b = noReg;
+            }
+        }
+        cond = br.cond;
+        at = k - 1;
+        return true;
+    }
+
+    // reverse postorder of the physical flow, and the immediate dominators
+    rpoNum.setLength(ns);
+    rpoNum[][] = uint.max;
+    {
+        Barray!uint post;
+        scope (exit) post.dtor();
+        seen.setLength(ns);
+        seen[][] = false;
+        next.setLength(ns);
+        next[][] = 0;
+        stack.push(0);
+        seen[0] = true;
+        while (stack.length)
+        {
+            const v = stack[stack.length - 1];
+            const k = psuccStart[v] + next[v];
+            if (k < psuccStart[v + 1])
+            {
+                ++next[v];
+                const t = psucc[k];
+                if (!seen[t])
+                {
+                    seen[t] = true;
+                    stack.push(t);
+                }
+            }
+            else
+            {
+                post.push(v);
+                stack.setLength(stack.length - 1);
+            }
+        }
+        foreach_reverse (v; post[])
+        {
+            rpoNum[v] = cast(uint)rpo.length;
+            rpo.push(v);
+        }
+    }
+    idom.setLength(ns);
+    idom[][] = uint.max;
+    idom[0] = 0;
+    for (bool changed = true; changed; )
+    {
+        changed = false;
+        foreach (v; rpo[][1 .. $])
+        {
+            uint d = uint.max;
+            foreach (p; ppreds[ppredStart[v] .. ppredStart[v + 1]])
+            {
+                if (idom[p] == uint.max)
+                    continue;
+                if (d == uint.max)
+                {
+                    d = p;
+                    continue;
+                }
+                uint a = p, b = d;
+                while (a != b)
+                {
+                    while (rpoNum[a] > rpoNum[b]) a = idom[a];
+                    while (rpoNum[b] > rpoNum[a]) b = idom[b];
+                }
+                d = a;
+            }
+            if (d != uint.max && idom[v] != d)
+            {
+                idom[v] = d;
+                changed = true;
+            }
+        }
+    }
+
+    // the facts at the end of each segment, those after the defining instructions it has
+    enum maxFacts = 12;
+    factStart.setLength(ns);
+    factEnd.setLength(ns);
+    factStart[][] = 0;
+    factEnd[][] = 0;
+    bool any;
+    changedBlock.setLength(blocks.length);
+    changedBlock[][] = false;
+    foreach (v; rpo[])
+    {
+        const from = cast(uint)facts.length;
+        if (v != 0)
+        {
+            // the only segment going to v, if one
+            uint pred = uint.max;
+            bool single = true;
+            foreach (p; ppreds[ppredStart[v] .. ppredStart[v + 1]])
+            {
+                if (pred != uint.max && p != pred)
+                    single = false;
+                pred = p;
+            }
+            if (pred == uint.max)
+                single = false;
+            const d = idom[v];
+            if (single && pred == d)
+            {
+                foreach (k; factStart[d] .. factEnd[d])
+                    facts.push(facts[k]);
+            }
+            else if (d != uint.max)
+            {
+                foreach (k; factStart[d] .. factEnd[d])
+                    if (facts[k].global)
+                        facts.push(facts[k]);
+            }
+            Test t;
+            uint cond, at, brAt;
+            if (single && endTest(pred, t, cond, at, brAt))
+            {
+                const LIns* br = &ins[brAt];
+                const taken = br.flags & F.toLabel ? labelSeg[br.target] : blockSeg[br.target];
+                uint fall = uint.max;
+                foreach (s; psucc[psuccStart[pred] .. psuccStart[pred + 1]])
+                    if (s != taken)
+                        fall = s;
+                if ((v == taken) != (v == fall))
+                {
+                    Fact f;
+                    f.t = t;
+                    f.cond = cast(ubyte)cond;
+                    f.holds = v == taken;
+                    f.global = once(t.a) && once(t.b);
+                    facts.push(f);
+                }
+            }
+        }
+        // the facts the segment's definitions leave, at most maxFacts, the nearest
+        uint keep = from;
+        foreach (k; from .. cast(uint)facts.length)
+        {
+            Fact f = facts[k];
+            bool killed;
+            foreach (n; segStart[v] .. segEnd(v))
+            {
+                const r = ins[n].d;
+                if (r && (r == f.t.a || r == f.t.b))
+                    killed = true;
+            }
+            if (!killed)
+                facts[keep++] = f;
+        }
+        facts.setLength(keep);
+        factStart[v] = keep - from > maxFacts ? keep - maxFacts : from;
+        factEnd[v] = keep;
+
+        // the segment's own test, decided by the facts before it, or the same as the one before it
+        Test t;
+        uint cond, at, brAt;
+        if (!endTest(v, t, cond, at, brAt))
+            continue;
+        int outcome = -1;
+        foreach_reverse (k; factStart[v] .. factEnd[v])
+        {
+            outcome = decideTest(facts[k], t, cond);
+            if (outcome >= 0)
+                break;
+        }
+        LIns* br = &ins[brAt];
+        if (outcome >= 0)
+        {
+            if (outcome)
+            {
+                br.op = LOp.br;
+                br.cond = COND.al;
+                br.a = noReg;
+                br.imm = 0;
+            }
+            else
+                *br = LIns.init;
+            any = true;
+            changedBlock[segBlock[v]] = true;
+            continue;
+        }
+    }
+
+    /* a comparison the same as the last one made, of registers not changed since, with
+     * nothing changing the flags in between, is not made again: in a segment, and from the
+     * comparison whose branch is all that leads to it in its block
+     */
+    if (repeats)
+        foreach (v; rpo[])
+        {
+            uint last = uint.max;     // the comparison the flags are of
+            uint pred = uint.max;
+            bool single = true;
+            foreach (p; ppreds[ppredStart[v] .. ppredStart[v + 1]])
+            {
+                if (pred != uint.max && p != pred)
+                    single = false;
+                pred = p;
+            }
+            Test pt;
+            uint pcond, pat, pbrAt;
+            if (v != 0 && single && pred != uint.max && segBlock[pred] == segBlock[v] &&
+                endTest(pred, pt, pcond, pat, pbrAt) && pat != uint.max)
+                last = pat;
+            foreach (n; segStart[v] .. segEnd(v))
+            {
+                LIns* i = &ins[n];
+                const isCmp = i.op == LOp.cmp || i.op == LOp.cmpi || i.op == LOp.fcmp || i.op == LOp.fcmpz;
+                if (isCmp && last != uint.max)
+                {
+                    const LIns* c = &ins[last];
+                    if (c.op == i.op && c.sz == i.sz && c.a == i.a && c.b == i.b && c.imm == i.imm)
+                    {
+                        *i = LIns.init;
+                        any = true;
+                        continue;
+                    }
+                }
+                if (isCmp)
+                {
+                    last = cast(uint)n;
+                    continue;
+                }
+                if (setsFlags(*i) || last != uint.max && i.d && (i.d == ins[last].a || i.d == ins[last].b))
+                    last = uint.max;
+            }
+        }
+    if (!any)
+        return;
+
+    /* the comparisons whose branches are gone, now that no instruction reads the flags
+     * they set: control flow within a block only goes forward, and the flags do not live
+     * from block to block
+     */
+    foreach (bi; 0 .. blocks.length)
+    {
+        if (!changedBlock[bi])
+            continue;
+        const bend = blockStart[bi + 1];
+        // whether the flags as they are before instruction n are read on a way on from it
+        bool readFrom(uint n, uint depth)
+        {
+            if (depth > 8)
+                return true;
+            for (uint k = n; k < bend; ++k)
+            {
+                const LIns* i = &ins[k];
+                if (readsFlags(*i))
+                    return true;
+                if (setsFlags(*i))
+                    return false;
+                if (i.op != LOp.br && i.op != LOp.cbz)
+                    continue;
+                if (i.flags & F.toLabel)
+                {
+                    const s = labelSeg[i.target];
+                    if (segBlock[s] == bi && (segStart[s] <= k || readFrom(segStart[s], depth + 1)))
+                        return true;
+                }
+                if (i.op == LOp.br)
+                    return false;
+            }
+            return false;
+        }
+        foreach (n; blockStart[bi] .. bend)
+        {
+            LIns* c = &ins[n];
+            if ((c.op == LOp.cmp || c.op == LOp.cmpi || c.op == LOp.fcmp || c.op == LOp.fcmpz) &&
+                !readFrom(cast(uint)n + 1, 0))
+                *c = LIns.init;
+        }
     }
 }
 
