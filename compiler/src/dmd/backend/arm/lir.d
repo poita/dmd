@@ -14310,20 +14310,26 @@ private bool vectorizeReductionChains()
     cur[][] = -1;
     Barray!uint allReads, endReads;     // by register: its reads, and those in the region of its value at the end
     scope (exit) { allReads.dtor(); endReads.dtor(); }
-    allReads.setLength(nregs);
-    allReads[][] = 0;
-    endReads.setLength(nregs);
-    endReads[][] = 0;
-    foreach (ref i; ins[])
+    // counted once a region may have a chain
+    void countReads()
     {
-        void count(Reg r) { if (!isPhys(r) && r - firstVreg < nregs) ++allReads[r - firstVreg]; }
-        if (i.op == LOp.ldp)
+        if (allReads.length)
+            return;
+        allReads.setLength(nregs);
+        allReads[][] = 0;
+        endReads.setLength(nregs);
+        endReads[][] = 0;
+        foreach (ref i; ins[])
         {
-            if (i.a) count(i.a);
-            if (i.b) count(i.b);
+            void count(Reg r) { if (!isPhys(r) && r - firstVreg < nregs) ++allReads[r - firstVreg]; }
+            if (i.op == LOp.ldp)
+            {
+                if (i.a) count(i.a);
+                if (i.b) count(i.b);
+            }
+            else
+                forUses(i, &count);
         }
-        else
-            forUses(i, &count);
     }
 
     // a step of a chain: d = op(x, y), with the comparison c of a minimum or maximum
@@ -14361,6 +14367,19 @@ private bool vectorizeReductionChains()
     bool any;
     void doRegion(uint rs, uint re)
     {
+        {
+            // a chain needs 3 operations of 32 bits and 4 loads
+            uint nops, nld;
+            foreach (ref i; ins[rs .. re])
+            {
+                nops += i.sz == 4 && (i.op == LOp.csel || i.op == LOp.add || i.op == LOp.and_ || i.op == LOp.orr ||
+                                      i.op == LOp.eor);
+                nld += i.op == LOp.ld && !i.b && i.sz <= 4;
+            }
+            if (nops < 3 || nld < 4)
+                return;
+        }
+        countReads();
         const len = re - rs;
         foreach (r; touched[])
             cur[r - firstVreg] = -1;
