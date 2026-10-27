@@ -911,16 +911,19 @@ struct Merger
             }
 
             // The bytes removed: a multiple of the alignment, so that what follows keeps
-            // its alignment. In __eh_frame, the rest of a dropped record is padding of
-            // the record before (see `fixFrameRecords`).
+            // its alignment; in __eh_frame, all of a dropped record, so that the records
+            // follow each other, 4-byte aligned as they are
             foreach (ref sect; p.sects)
             {
                 if (!sect.dropped.length)
                     continue;
-                const a = 1UL << sect.align_;
+                const eh = isEhFrame(sect.segname, sect.sectname);
+                const a = eh ? 4 : 1UL << sect.align_;
                 ulong before;
                 foreach (ref d; sect.dropped)
                 {
+                    if (eh && (d.end - d.start) % a)
+                        fail("frame record not a multiple of 4 bytes");
                     const n = (d.end - d.start) / a * a;
                     if (n)
                     {
@@ -1168,16 +1171,15 @@ struct Merger
                 {
                     if (s.out_ != oi)
                         continue;
-                    const a = 1UL << s.align_;
+                    // the frame records of a part follow those of the part before, 4-byte
+                    // aligned as the records of a part are
+                    const eh = isEhFrame(os.segname, os.sectname);
+                    const a = eh ? 4 : 1UL << s.align_;
                     const aligned = (size + a - 1) & ~(a - 1);
-                    if (aligned != size && isEhFrame(os.segname, os.sectname))
-                        fail("frame records not aligned");
+                    if (eh && (aligned != size || s.mappedSize() % 4))
+                        fail("frame records not a multiple of 4 bytes");
                     s.base = aligned;
                     size = aligned + s.mappedSize();
-                    // the records of the next part follow aligned: the last record here
-                    // is padded to them
-                    if (isEhFrame(os.segname, os.sectname))
-                        size = (size + a - 1) & ~(a - 1);
                 }
             os.size = size;
         }
@@ -1352,14 +1354,8 @@ struct Merger
                         const to = start + s.map(d.end);
                         os.data.buf[from .. to] = 0;
                     }
-                    if (isEhFrame(s.segname, s.sectname))
-                    {
-                        const a = 1UL << s.align_;
-                        const chunk = (s.mappedSize() + a - 1) & ~(a - 1);
-                        os.data.zeros(cast(size_t)(start + chunk - os.data.length));
-                        if (s.dropped.length || chunk != s.size)
-                            fixFrameRecords(s, os.data.buf.ptr + start, chunk);
-                    }
+                    if (s.removed.length && isEhFrame(s.segname, s.sectname))
+                        rebaseCiePointers(s, os.data.buf.ptr + start);
                     copyRelocs(p, cast(uint)si, os, start, (ref const Reloc r) => false);
                 }
             if (!os.zerofill && os.data.length != os.size)
@@ -1372,39 +1368,26 @@ struct Merger
         return seg == "__TEXT" && sect == "__eh_frame";
     }
 
-    /**
-     * Rewrite the records kept of `eh`, copied to `bytes`, for the records removed: the
-     * distance of a frame description entry back to its CIE, and the length of each,
-     * which takes in what follows it up to the next record kept or the end of the
-     * `chunk` as padding (DW_CFA_nop).
-     */
-    static void fixFrameRecords(ref const Sect eh, ubyte* bytes, ulong chunk)
+    /// Rewrite the CIE pointers of the frame description entries kept of `eh`, copied
+    /// to `bytes`: the distance back to their CIE changes with the records removed
+    static void rebaseCiePointers(ref const Sect eh, ubyte* bytes)
     {
         size_t off;
-        long last = -1;       // the record kept before
         while (off < eh.size)
         {
             const len = rd32(eh.data.ptr + off);
             if (len < 4)
                 fail("frame record without an identifier");
             const id = rd32(eh.data.ptr + off + 4);
-            if (!eh.droppedAt(off))
+            if (id && !eh.droppedAt(off))
             {
-                if (id)
-                {
-                    const cie = off + 4 - id;
-                    if (eh.droppedAt(cie))
-                        fail("frame description entry of a removed CIE");
-                    wr32(bytes + eh.map(off) + 4, cast(uint)(eh.map(off + 4) - eh.map(cie)));
-                }
-                if (last >= 0)
-                    wr32(bytes + eh.map(last), cast(uint)(eh.map(off) - eh.map(last) - 4));
-                last = off;
+                const cie = off + 4 - id;
+                if (eh.droppedAt(cie))
+                    fail("frame description entry of a removed CIE");
+                wr32(bytes + eh.map(off) + 4, cast(uint)(eh.map(off + 4) - eh.map(cie)));
             }
             off += 4 + len;
         }
-        if (last >= 0)
-            wr32(bytes + eh.map(last), cast(uint)(chunk - eh.map(last) - 4));
     }
 
     /// Translate the relocations of part `p`'s section `si` to `os`, whose bytes for the
@@ -2196,7 +2179,12 @@ struct Merger
             size_t rc;      // the relocations before are of the DIEs copied
             Reader r = Reader(info.data[0 .. u.end], u.dies);
             int depth;
-            int skipDepth = -1;     // the depth of the DIE whose subtree is skipped
+            /* The DIEs of a removed subprogram go, but for the types among them, which
+             * the code generator writes where they are first needed, and other DIEs
+             * may refer to: they are kept, as children of the subprogram's parent.
+             */
+            int removed = -1;       // the depth of the removed subprogram being skipped
+            int hoisted = -1;       // the depth of the type kept of it being copied
             while (r.pos < u.end)
             {
                 const dieStart = r.pos;
@@ -2204,10 +2192,17 @@ struct Merger
                 if (!code)
                 {
                     --depth;
-                    if (skipDepth >= 0)
+                    if (removed >= 0)
                     {
-                        if (depth == skipDepth)
-                            skipDepth = -1;
+                        if (hoisted >= 0 && depth >= hoisted)
+                        {
+                            dies[pi] ~= DieAt(dieStart, os.data.length, true);
+                            os.data.put8(0);
+                            if (depth == hoisted)
+                                hoisted = -1;
+                        }
+                        else if (depth == removed)
+                            removed = -1;
                         continue;
                     }
                     // the end of the unit's children is written once, after all parts'
@@ -2233,15 +2228,24 @@ struct Merger
                     skipForm(r, form, u.version_);
                     a.end = r.pos;
                 }
-                const isUnit = depth == 0;
+                const level = depth;
+                const isUnit = level == 0;
                 if (ab.children)
                     ++depth;
-                if (skipDepth >= 0)
-                    continue;
-                if (isUnit ? pi != firstUnit : removesDie(p, *info, order, *ab, attrs))
+                if (removed >= 0)
+                {
+                    if (hoisted < 0)
+                    {
+                        if (!isTypeTag(ab.tag))
+                            continue;
+                        if (ab.children)
+                            hoisted = level;
+                    }
+                }
+                else if (isUnit ? pi != firstUnit : removesDie(p, *info, order, *ab, attrs))
                 {
                     if (ab.children && !isUnit)
-                        skipDepth = depth - 1;
+                        removed = level;
                     continue;
                 }
                 dies[pi] ~= DieAt(dieStart, os.data.length);
@@ -2339,7 +2343,7 @@ struct Merger
                     }
                 }
             }
-            if (depth != 0 || skipDepth >= 0)
+            if (depth != 0 || removed >= 0)
                 fail("unterminated DIE");
         }
         os.data.put8(0);
@@ -2352,6 +2356,19 @@ struct Merger
                 fail("reference too large");
             foreach (i; 0 .. rp.size)
                 os.data.buf[rp.at + i] = cast(ubyte)(t >> (8 * i));
+        }
+    }
+
+    /// Returns: whether DIEs of `tag` describe a type
+    static bool isTypeTag(uint tag)
+    {
+        switch (tag)
+        {
+            case 0x01, 0x02, 0x04, 0x0f, 0x10, 0x12, 0x13, 0x15, 0x16, 0x17, 0x1f, 0x20, 0x21,
+                 0x24, 0x26, 0x29, 0x2d, 0x35, 0x37, 0x38, 0x3b, 0x40, 0x42, 0x44, 0x47, 0x4b:
+                return true;
+            default:
+                return false;
         }
     }
 
