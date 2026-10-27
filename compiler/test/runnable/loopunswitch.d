@@ -254,6 +254,21 @@ double floats(const(double)[] a, double t)
     return s;
 }
 
+// a loop on the way to a throw only
+pragma(inline, false)
+void coldLoop(const(int)[] a, bool flag)
+{
+    int s;
+    foreach (x; a)
+    {
+        if (flag)
+            s += x;
+        else
+            s -= x;
+    }
+    throw new Exception(s > 0 ? "positive" : "not positive");
+}
+
 // a check that -release keeps
 void check(bool c, int line = __LINE__)
 {
@@ -330,4 +345,14 @@ void main()
 
     check(floats([1.0, 2.0], 2.0) == 6.0);
     check(floats([1.0, 2.0], double.nan) == -3.0);
+
+    foreach (flag; [false, true])
+    {
+        string msg;
+        try
+            coldLoop(a, flag);
+        catch (Exception e)
+            msg = e.msg;
+        check(msg == (flag ? "positive" : "not positive"));
+    }
 }

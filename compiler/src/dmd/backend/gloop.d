@@ -4511,14 +4511,7 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
 
     // a limit on the loops unswitched in a function, whatever becomes of the marks on their blocks
     enum maxPerFunction = 8;
-    __gshared const(Symbol)* countedFunc;
-    __gshared int count;
-    if (countedFunc !is funcsym_p)
-    {
-        countedFunc = funcsym_p;
-        count = 0;
-    }
-    if (count >= maxPerFunction)
+    if (go.unswitched >= maxPerFunction)
         return false;
 
     block* head = l.Lhead;
@@ -4705,6 +4698,34 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     if (ib == nblocks)
         return false;
 
+    /* A loop from which every path ends in a block that never returns, such
+     * as a throw or a failed assert, is rarely run: not worth the code
+     */
+    {
+        vec_t seen = vec_calloc(bo.dfo.length);
+        scope (exit) vec_free(seen);
+        Barray!(block*) stack;
+        scope (exit) stack.dtor();
+        stack.push(head);
+        vec_setbit(head.Bdfoidx, seen);
+        bool returns;
+        while (stack.length && !returns)
+        {
+            block* b = stack[stack.length - 1];
+            stack.setLength(stack.length - 1);
+            if (b.bc == BC.ret || b.bc == BC.retexp)
+                returns = true;
+            foreach (s; b.Bsucc[])
+                if (!vec_testbit(s.Bdfoidx, seen))
+                {
+                    vec_setbit(s.Bdfoidx, seen);
+                    stack.push(s);
+                }
+        }
+        if (!returns)
+            return false;
+    }
+
     if (log)
     {
         printf("loopunswitch() %s: %d blocks, cost %d, condition ", funcsym_p.Sident.ptr, cast(int)nblocks, cost);
@@ -4775,7 +4796,7 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     el_free(cond);
     *pcond = el_long(ty, 1);
 
-    ++count;
+    ++go.unswitched;
     block_pred(bo.startblock);
     go.changes++;
     return true;
