@@ -2018,7 +2018,7 @@ static if (1)
                 DW_AT_name,       DW_FORM_string,
                 DW_AT_type,       DW_FORM_ref4,
                 DW_AT_artificial, DW_FORM_flag,
-                DW_AT_decl_file,   DW_FORM_data1,
+                DW_AT_decl_file,   DW_FORM_udata,
                 DW_AT_decl_line,   DW_FORM_udata,
                 DW_AT_decl_column, DW_FORM_udata,
                 DW_AT_location,    DW_FORM_block1,
@@ -2058,9 +2058,10 @@ static if (1)
             }
         }
 
+        /* No DW_AT_sibling: of the last subprogram of the unit, it would refer to the
+         * entry ending the unit's children, which is no entry
+         */
         dwarfabbrev.append(DW_TAG_subprogram, haveparameters);
-        if (haveparameters == DW_CHILDREN_yes)
-            dwarfabbrev.append(DW_AT_sibling, DW_FORM_ref4);
 
         dwarfabbrev.append(
             config.dwarf >= 4
@@ -2100,7 +2101,7 @@ static if (1)
 
         funcabbrevcode = dwarfabbrev.awrite!([
             DW_AT_name, DW_FORM_string,
-            DW_AT_decl_file, DW_FORM_data1,
+            DW_AT_decl_file, DW_FORM_udata,
             DW_AT_decl_line, DW_FORM_udata,
             DW_AT_decl_column, DW_FORM_udata,
             DW_AT_low_pc, DW_FORM_addr,
@@ -2108,16 +2109,8 @@ static if (1)
             DW_AT_frame_base, DW_FORM_data4,
         ]);
 
-        uint idxsibling = 0;
-        uint siblingoffset;
-
         uint infobuf_offset = cast(uint)debug_info.buf.length();
         debug_info.buf.writeuLEB128(funcabbrevcode); // abbreviation code
-        if (haveparameters == DW_CHILDREN_yes)
-        {
-            siblingoffset = cast(uint)debug_info.buf.length();
-            debug_info.buf.write32(idxsibling);                       // DW_AT_sibling
-        }
 
         const(char)* name = getSymName(sfunc);
 
@@ -2136,7 +2129,7 @@ static if (1)
             debug_info.buf.writeByte(true);                           // DW_AT_pure
 
         debug_info.buf.writeStringz(name);                            // DW_AT_name
-        debug_info.buf.writeByte(cast(ubyte)filenum);                 // DW_AT_decl_file
+        debug_info.buf.writeuLEB128(filenum);                         // DW_AT_decl_file
         debug_info.buf.writeuLEB128(sfunc.Sfunc.Fstartline.Slinnum);  // DW_AT_decl_line
         debug_info.buf.writeuLEB128(sfunc.Sfunc.Fstartline.Scharnum); // DW_AT_decl_column
 
@@ -2181,7 +2174,7 @@ static if (1)
                         debug_info.buf.writeStringz(getSymName(sa));   // DW_AT_name
                         debug_info.buf.write32(tidx);                 // DW_AT_type
                         debug_info.buf.writeByte(sa.Sflags & SFLartifical ? 1 : 0); // DW_FORM_tag
-                        debug_info.buf.writeByte(cast(ubyte)filenum);               // DW_AT_decl_file
+                        debug_info.buf.writeuLEB128(filenum);                       // DW_AT_decl_file
                         debug_info.buf.writeuLEB128(sa.lposscopestart.Slinnum);     // DW_AT_decl_line
                         debug_info.buf.writeuLEB128(sa.lposscopestart.Scharnum);    // DW_AT_decl_column
                         soffset = cast(uint)debug_info.buf.length();
@@ -2286,9 +2279,6 @@ static if (1)
                 }
             }
             debug_info.buf.writeByte(0);              // end of parameter children
-
-            idxsibling = cast(uint)debug_info.buf.length();
-            *cast(uint*)(debug_info.buf.buf + siblingoffset) = idxsibling;
         }
 
         /* ============= debug_pubnames =========================== */
