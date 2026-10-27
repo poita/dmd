@@ -30,9 +30,15 @@ the parts (`ld -r`, or the library writer) placed them:
    compilation can each have a copy of a string literal that the unsplit
    compilation has once.
 
+With --stress K, each -j=N is also compiled K more times in the determinism stress
+mode of the compiler (DMD_SPLIT_STRESS set to K different seeds, from --stress-seed
+on), in which every process of the split sleeps for pseudo-random short times at the
+points where they synchronize, so that they run at other relative speeds: each of
+those outputs must be byte for byte the -j=N output compiled without it.
+
 Usage:
-  splitcheck.py [-j 2,3,8] [-r 3] [--dmd DMD] [--cwd DIR] [--keep] [--require-split]
-                [--verbose] -- dmd-command...
+  splitcheck.py [-j 2,3,8] [-r 3] [--stress K [--stress-seed S]] [--dmd DMD] [--cwd DIR]
+                [--keep] [--require-split] [--verbose] -- dmd-command...
 
 The dmd command compiles to an object file (-c, with -of), to object files (-c
 without -of: one per module) or to a library (-lib); a command that would link
@@ -615,7 +621,7 @@ def output_kind(cmd):
     return "obj"
 
 
-def compile_once(cmd, kind, jobs, outdir, cwd, logfile):
+def compile_once(cmd, kind, jobs, outdir, cwd, logfile, stress=0):
     os.makedirs(outdir, exist_ok=True)
     args = strip_options(cmd)
     if kind == "obj":
@@ -630,12 +636,17 @@ def compile_once(cmd, kind, jobs, outdir, cwd, logfile):
     env = dict(os.environ)
     env["SOURCE_DATE_EPOCH"] = "0"
     env["DMD_SPLIT_LOG"] = logfile
+    if stress:
+        env["DMD_SPLIT_STRESS"] = str(stress)
+    else:
+        env.pop("DMD_SPLIT_STRESS", None)
     if os.path.exists(logfile):
         os.remove(logfile)
     p = subprocess.run(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     log = open(logfile).read().strip() if os.path.exists(logfile) else ""
     if p.returncode != 0:
-        raise RuntimeError("-j=%d failed:\n%s" % (jobs, p.stdout.decode(errors="replace")))
+        raise RuntimeError("-j=%d%s failed:\n%s" % (jobs, " (stress seed %d)" % stress if stress else "",
+                                                   p.stdout.decode(errors="replace")))
     return log
 
 
@@ -667,6 +678,9 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the outputs")
     ap.add_argument("--require-split", action="store_true", help="fail if a -j=N compilation is not split")
     ap.add_argument("--limit", type=int, default=20, help="differences reported per comparison")
+    ap.add_argument("--stress", type=int, default=0, metavar="K",
+                    help="compilations of each -j=N in the determinism stress mode, compared byte for byte")
+    ap.add_argument("--stress-seed", type=int, default=1, metavar="S", help="the first stress seed")
     ap.add_argument("command", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     cmd = a.command
@@ -722,6 +736,30 @@ def main():
                             "-j=%d compilation %d" % (n, k + 1), report, a.limit)
             if a.repeat > 1 and not failed:
                 report("-j=%d: %d compilations byte for byte the same" % (n, a.repeat))
+            stressed = 0
+            for k in range(a.stress):
+                seed = a.stress_seed + k
+                out = os.path.join(work, "j%d-s%d" % (n, seed))
+                log = compile_once(cmd, kind, n, out, a.cwd, logfile, seed)
+                files = output_files(kind, out)
+                if a.require_split and not log.endswith("succeeded"):
+                    report("-j=%d stress seed %d: the compilation was not split: %s" % (n, seed, log or "not split"))
+                    failed = True
+                elif [os.path.basename(f) for f in files] != [os.path.basename(f) for f in first[0]] or \
+                        [open(f, "rb").read() for f in files] != first[1]:
+                    report("-j=%d stress seed %d: the output differs from the one compiled without stress" % (n, seed))
+                    failed = True
+                    firstobjs = [(os.path.basename(f), b) for f, b in zip(first[0], first[1])]
+                    if kind == "lib":
+                        firstobjs = [(n2, b2) for f, b in firstobjs for n2, b2 in read_archive(b, f)]
+                    compare(collect(firstobjs), collect(objects_of(kind, files)),
+                            "-j=%d stress seed %d" % (n, seed), report, a.limit)
+                else:
+                    stressed += 1
+                shutil.rmtree(out, ignore_errors=True)
+            if a.stress:
+                report("-j=%d: %d of %d stressed compilations byte for byte the same (seeds %d-%d)" %
+                       (n, stressed, a.stress, a.stress_seed, a.stress_seed + a.stress - 1))
     except (RuntimeError, ValueError) as e:
         report(str(e))
         failed = True

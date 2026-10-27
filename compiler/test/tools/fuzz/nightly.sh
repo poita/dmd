@@ -24,11 +24,12 @@ echo "seeds $from-$to, work $work" | tee "$log"
 python3 "$here/fuzz.py" prog "$from-$to" -j "$jobs" --work "$work" --minimize "$@" >>"$log" 2>&1 || status=1
 python3 "$here/fuzz.py" abi "$from-$to" -j "$jobs" --work "$work" "$@" >>"$log" 2>&1 || status=1
 # split compilations against unsplit ones, on a thirtieth as many seeds, as each
-# program is compiled some forty times
+# program is compiled some forty times, and some forty more in the determinism stress
+# mode
 scount=$(( count / 30 > 0 ? count / 30 : 1 ))
 sfrom=$(( (day % 10000) * scount + 1 ))
 sto=$(( sfrom + scount - 1 ))
-python3 "$here/splitfuzz.py" "$sfrom-$sto" -j "$jobs" --work "$work" >>"$log" 2>&1 || status=1
+python3 "$here/splitfuzz.py" "$sfrom-$sto" -j "$jobs" --work "$work" --stress 4 >>"$log" 2>&1 || status=1
 cat "$log"
 echo "log: $log, failures in $work/fail"
 exit $status

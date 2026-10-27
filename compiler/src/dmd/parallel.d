@@ -25,6 +25,38 @@
  * cannot generate what an unsplit compilation would, such as a function another worker
  * needs that it has not generated, gives up the split.
  *
+ * The processes of a split share memory (`NameTable` and `Rendezvous`) and files (the
+ * output parts, and what each worker reports to the original process). Each piece of
+ * it is read only once the writes it depends on are known to be done:
+ *
+ * $(UL
+ * $(LI A name in the `NameTable` is written to arena space the worker reserves
+ *      (`atomicFetchAdd` of `used`) before it publishes the entry by a `cas` of its
+ *      slot, so a worker finding the entry through the slot reads the whole name.
+ *      An entry reserved by a worker that lost the race for the slot stays in the
+ *      arena with no worker needing it, which the scans of the arena skip.)
+ * $(LI The fields `need`, `owner` and `group` of the entries and each worker's
+ *      `pending` and `load` are written while the workers publish what they need,
+ *      before they meet, and read after they meet: `meet` is a barrier, as each
+ *      worker's arrival is a read-modify-write of `arrived` and the last to arrive
+ *      releases the others by a store of `meetings` that they load. The scans of the
+ *      arena between the meetings of a round see every entry published in the round.)
+ * $(LI The `owner` of a group settled in a round is stored while the other workers
+ *      may still be reading it in the same round; they only compare its round with
+ *      the current one, which reads the same whether they see the store or not. The
+ *      second meeting of the round separates those reads from the next publications.)
+ * $(LI `abort` is only ever set to give up, and `reason` is read by the original
+ *      process once every worker has exited, after `waitpid`.)
+ * $(LI A worker's output part, its output on stdout and stderr, and the results it
+ *      reports are written before it exits, and read by the original process after
+ *      `waitpid` has returned for every worker.)
+ * )
+ *
+ * With the environment variable `DMD_SPLIT_STRESS` set to a number other than 0, every
+ * process of a split sleeps for short pseudo-random times at each of these
+ * synchronization points (see `stressPause`), changing with the number how the
+ * workers interleave; the output must not change.
+ *
  * Copyright:   Copyright (C) 1999-2026 by The D Language Foundation, All Rights Reserved
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  */
@@ -339,6 +371,7 @@ Workers split(ref Modules modules, uint n, uint[] assign)
         }
         w.assign = assign;
         splitOwner = getpid();
+        initStress();
         rendezvous = cast(Rendezvous*)r;
         names = cast(NameTable*)t;
         workerCount = cast(uint)n;
@@ -367,12 +400,15 @@ Workers split(ref Modules modules, uint n, uint[] assign)
                 resultFile = result;
                 workerIndex = cast(uint)k;
                 w.index = cast(int)k;
+                stressProcess = workerIndex + 1;
+                stressCalls[] = 0;
                 atexit(&leaving);
                 break;
             }
             children ~= pid;
             outputs ~= output;
             results ~= result;
+            stressPause(StressPoint.fork);
         }
 
         if (w.isChild)
@@ -397,6 +433,7 @@ Workers split(ref Modules modules, uint n, uint[] assign)
             }
             modules.setDim(k);
             adopting = true;
+            stressPause(StressPoint.start);
             return w;
         }
 
@@ -410,6 +447,7 @@ Workers split(ref Modules modules, uint n, uint[] assign)
         auto exited = new bool[children.length];
         foreach (_; 0 .. children.length)
         {
+            stressPause(StressPoint.wait);
             int status;
             pid_t pid;
             do
@@ -441,6 +479,7 @@ Workers split(ref Modules modules, uint n, uint[] assign)
         }
         if (w.succeeded)
         {
+            stressPause(StressPoint.readResults);
             foreach (result; results)
                 readResult(result);
         }
@@ -492,6 +531,83 @@ uint workerStride()
         return names ? workerCount : 1;
     else
         return 1;
+}
+
+/// The synchronization points of a split at which `stressPause` sleeps
+enum StressPoint : uint
+{
+    fork,           /// in the original process, after forking a worker
+    start,          /// in a worker, once it has started
+    publish,        /// in a worker, between publishing names in the shared table
+    reserve,        /// in a worker, between reserving arena space for a name and publishing it
+    arrive,         /// in a worker, before arriving at a meeting
+    leave,          /// in a worker, after leaving a meeting
+    settle,         /// in a worker, between settling the owners of groups
+    generate,       /// in a worker, after generating a function or template instance
+    giveUp,         /// in a worker giving up, before recording why
+    writePart,      /// in a worker, before writing its output part
+    report,         /// in a worker, before reporting its results
+    exit,           /// in a worker, before exiting
+    wait,           /// in the original process, before waiting for a worker
+    readResults,    /// in the original process, before reading the workers' results
+    merge,          /// in the original process, before combining the parts
+}
+
+/* The seed of the pauses of `stressPause`, from `DMD_SPLIT_STRESS`: 0 when off. Set by
+ * `split` before it forks, so the workers inherit it.
+ */
+private __gshared ulong stressSeed;
+private __gshared uint stressProcess;      // 0 in the original process, a worker's number + 1
+private __gshared uint[StressPoint.max + 1] stressCalls;   // in this process, of each point
+
+/**************************************
+ * In a process of a split compilation with `DMD_SPLIT_STRESS` set, sleep for a
+ * pseudo-random short time, a function of the seed, the process (the worker's number,
+ * or the original process), the point and how many times this process has reached it.
+ * Most pauses are short or none; some take milliseconds, so that a worker can fall
+ * well behind the others.
+ */
+void stressPause(StressPoint point)
+{
+    version (Posix)
+    {
+        import core.sys.posix.time : nanosleep, timespec;
+
+        if (!stressSeed)
+            return;
+        ulong x = stressSeed ^ (stressProcess + 1) * 0x9E3779B97F4A7C15UL ^
+                  (point + 1) * 0xC2B2AE3D27D4EB4FUL ^ ulong(stressCalls[point]++) << 40;
+        // splitmix64
+        x += 0x9E3779B97F4A7C15UL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+        x ^= x >> 31;
+        // the points reached for every name pause rarely, the others often
+        const frequent = point == StressPoint.publish || point == StressPoint.reserve ||
+                         point == StressPoint.settle || point == StressPoint.generate;
+        const roll = cast(uint)(x & 1023);
+        x >>= 10;
+        ulong micros;
+        if (frequent ? roll < 8 : roll < 512)
+            micros = x % 300;                       // up to 0.3 ms
+        else if (frequent ? roll < 9 : roll < 768)
+            micros = 1000 + x % 9000;               // 1 to 10 ms
+        else if (!frequent && roll < 800)
+            micros = 20_000 + x % 30_000;           // 20 to 50 ms
+        else
+            return;
+        timespec ts = timespec(0, cast(int)(micros * 1000));
+        nanosleep(&ts, null);
+    }
+}
+
+private void initStress()
+{
+    stressSeed = 0;
+    stressProcess = 0;
+    stressCalls[] = 0;
+    if (const s = getenv("DMD_SPLIT_STRESS"))
+        stressSeed = strtoull(s, null, 0);
 }
 
 /**************************************
@@ -555,7 +671,10 @@ void noteGenerated(const(char)[] name)
     version (Posix)
     {
         if (names)
+        {
             generatedNames[name] = true;
+            stressPause(StressPoint.generate);
+        }
     }
 }
 
@@ -644,6 +763,7 @@ bool settleRound(size_t generated, out Dsymbol[] generate)
         // tell the others what this worker needs that is not yet settled
         foreach (l; leftPinned)
         {
+            stressPause(StressPoint.publish);
             auto g = find(groupKey(l.group), true);
             auto f = find(l.name, true);
             if (!g || !f)
@@ -656,6 +776,7 @@ bool settleRound(size_t generated, out Dsymbol[] generate)
         size_t kept = 0;
         foreach (p; pending)
         {
+            stressPause(StressPoint.publish);
             auto g = find(groupKey(p.group), true);
             auto f = find(p.name, true);
             if (!g || !f)
@@ -734,6 +855,7 @@ bool settleRound(size_t generated, out Dsymbol[] generate)
             ++load[owner];
             if (owner == workerIndex)
             {
+                stressPause(StressPoint.settle);
                 atomicStore(n.e.owner, round << roundShift | (owner + 1));
                 groupsHere[n.name[1 .. $]] = true;
             }
@@ -802,11 +924,13 @@ version (Posix)
         import core.sys.posix.time : nanosleep, timespec;
         import core.sys.posix.unistd : getppid;
 
+        stressPause(StressPoint.arrive);
         const meeting = atomicLoad(rendezvous.meetings);
         if (atomicFetchAdd(rendezvous.arrived, 1) + 1 == workerCount)
         {
             atomicStore(rendezvous.arrived, 0u);
             atomicStore(rendezvous.meetings, meeting + 1);
+            stressPause(StressPoint.leave);
             return;
         }
         for (uint spins = 0; atomicLoad(rendezvous.meetings) == meeting; ++spins)
@@ -816,6 +940,7 @@ version (Posix)
             timespec ts = timespec(0, spins < 100 ? 20_000 : 500_000);
             nanosleep(&ts, null);
         }
+        stressPause(StressPoint.leave);
     }
 
     /* End this worker, and with it the split; the first worker to give up for a
@@ -826,6 +951,7 @@ version (Posix)
         import core.atomic : atomicStore, cas;
         if (reason.length && cas(&rendezvous.abort, 0u, 2u))
         {
+            stressPause(StressPoint.giveUp);
             snprintf(rendezvous.reason.ptr, rendezvous.reason.length, "%.*s: %.*s",
                 cast(int)reason.length, reason.ptr, cast(int)name.length, name.ptr);
         }
@@ -895,6 +1021,7 @@ version (Posix)
                     e.length = cast(uint)name.length;
                     memcpy(names.arena.ptr + offset + Entry.sizeof, name.ptr, name.length);
                     mine = offset + 1;
+                    stressPause(StressPoint.reserve);
                 }
                 if (cas(slot, 0u, mine))
                     return cast(Entry*)(names.arena.ptr + mine - 1);
@@ -928,10 +1055,12 @@ void exitWorker(bool ok)
         }
         if (pending.length)
             ok = false;
+        stressPause(StressPoint.report);
         foreach (name; global.params.libfiles[libfilesAtSplit .. $])
             fwrite(name, 1, strlen(name) + 1, resultFile);
         if (fflush(resultFile) != 0)
             ok = false;
+        stressPause(StressPoint.exit);
     }
     // exit() rather than _exit(), so that an instrumented compiler writes its profile
     exit(ok ? 0 : 1);
@@ -987,6 +1116,7 @@ bool mergeObjects(const(char)[] objfile, const(char)[][] parts)
 {
     version (Posix)
     {
+        stressPause(StressPoint.merge);
         const(char)*[] argv;
         argv ~= "ld";
         argv ~= "-r";
