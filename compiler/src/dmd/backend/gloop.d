@@ -908,6 +908,38 @@ restart:
         }
     }
 
+    /* Unswitch one loop at a time, trying the larger loops first so that a
+     * branch leaves as many of the loops it is invariant in as fit
+     */
+    if (go.mfoptim & MFtime)
+    {
+        bool[64] tried;
+        while (1)
+        {
+            size_t best = size_t.max;
+            uint bestSize;
+            foreach (i, ref l; startloop)
+            {
+                if (i >= tried.length || tried[i])
+                    continue;
+                const size = vec_numBitsSet(l.Lloop);
+                if (size > bestSize)
+                {
+                    best = i;
+                    bestSize = size;
+                }
+            }
+            if (best == size_t.max)
+                break;
+            tried[best] = true;
+            if (loopunswitch(go, bo, startloop[best]))
+            {
+                compdfo(bo.dfo, bo.startblock);
+                goto restart;
+            }
+        }
+    }
+
     /* Note that accessing the loops
      * starting from startloop will access them in least nested
      * one first, thus moving LIs out as far as possible
@@ -4437,6 +4469,281 @@ bool loopunroll(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     }
 
     //WRfunc("loopunroll done", funcsym_p, startblock);
+    return true;
+}
+
+/*********************************
+ * Unswitch loop `l`: a conditional branch in the loop whose condition is the
+ * same on every iteration becomes a test before the loop choosing between two
+ * copies of the loop, one for each outcome, in each of which the branch has
+ * a constant condition the block optimizer folds away.
+ *
+ * The condition is evaluated in the preheader, so before the loop runs at
+ * all: it is only variables, constants and operators that neither fault nor
+ * have side effects, so evaluating it when the loop runs zero times is
+ * harmless. Its value is the same as in the loop: no variable it reads is
+ * assigned in the loop, and when one may be reached through a pointer, the
+ * loop writes no memory through pointers and calls nothing.
+ *
+ * Code growth is bounded: the loop must be small, the copies count towards
+ * a limit for the whole function, and the blocks of an unswitched loop are
+ * marked so that neither copy, nor a loop around them, is unswitched again.
+ * Loops in or containing try blocks, and loops of other than plain gotos and
+ * conditional branches, are left alone.
+ * Params:
+ *      go = GlobalOptimizer
+ *      bo = BlockOpt
+ *      l = loop to unswitch
+ * Returns:
+ *      true if the loop was unswitched
+ */
+@trusted
+private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
+{
+    enum log = false;
+    if (config.target_cpu != TARGET_AArch64)
+        return false;
+
+    enum maxBlocks = 64;
+    enum maxLoopCost = 200;         // elem nodes in the loop to be copied
+    enum maxFunctionGrowth = 400;   // elem nodes copied in the whole function
+
+    // a limit on the loops unswitched in a function, whatever becomes of the marks on their blocks
+    enum maxPerFunction = 8;
+    __gshared const(Symbol)* countedFunc;
+    __gshared int count;
+    if (countedFunc !is funcsym_p)
+    {
+        countedFunc = funcsym_p;
+        count = 0;
+    }
+    if (count >= maxPerFunction)
+        return false;
+
+    block* head = l.Lhead;
+    block* pre = l.Lpreheader;
+    if (!pre || pre.bc != BC.goto_ || pre.Bsucc.length != 1 || pre.Bsucc[0] !is head || pre.Btry)
+        return false;
+
+    block*[maxBlocks] blocks;
+    size_t nblocks = 0;
+    int cost = 0;
+    for (size_t i = 0; (i = vec_index(i, l.Lloop)) < bo.dfo.length; ++i)
+    {
+        block* b = bo.dfo[i];
+        if (nblocks == maxBlocks || b.Btry || b.Bflags & BFL.unswitched ||
+            (b.bc != BC.goto_ && b.bc != BC.iftrue))
+            return false;
+        blocks[nblocks++] = b;
+        if (b.Belem)
+            cost += el_length(b.Belem);
+        if (cost > maxLoopCost)
+            return false;
+    }
+    bool inLoop(const block* b) { return vec_testbit(b.Bdfoidx, l.Lloop) != 0; }
+
+    // entered only at the head, and only from the preheader
+    foreach (b; blocks[0 .. nblocks])
+        foreach (p; b.Bpred[])
+            if (b is head ? !inLoop(p) && p !is pre : !inLoop(p))
+                return false;
+
+    int growth = 0;
+    foreach (b; bo.dfo[])
+        if (b.Bflags & BFL.unswitched && b.Belem)
+            growth += el_length(b.Belem);
+    if (growth / 2 + cost > maxFunctionGrowth)
+        return false;
+
+    /* The variables the loop assigns, and whether it may write other memory,
+     * which is through a pointer or by a call
+     */
+    Barray!(const(Symbol)*) defs;
+    scope (exit) defs.dtor();
+    bool writesMemory;
+    bool unsafe;
+    void scan(const(elem)* e)
+    {
+        while (1)
+        {
+            const op = e.Eoper;
+            switch (op)
+            {
+                case OPcall: case OPcallns: case OPucall: case OPucallns:
+                case OPmemcpy: case OPmemset: case OPstrcpy: case OPstrcat:
+                case OPvecsto: case OPcmpxchg: case OPhalt: case OPasm:
+                    writesMemory = true;
+                    break;
+                case OPctor: case OPdtor: case OPdctor: case OPmark: case OPddtor:
+                    unsafe = true;
+                    return;
+                default:
+                    break;
+            }
+            if (OTassign(op))
+            {
+                if (e.E1.Eoper == OPvar)
+                    defs.push(e.E1.Vsym);
+                else
+                    writesMemory = true;
+            }
+            if (OTleaf(op))
+                return;
+            if (OTbinary(op))
+                scan(e.E2);
+            e = e.E1;
+        }
+    }
+    foreach (b; blocks[0 .. nblocks])
+        if (b.Belem)
+            scan(b.Belem);
+    if (unsafe)
+        return false;
+
+    bool assigned(const Symbol* s)
+    {
+        foreach (d; defs[])
+            if (d is s)
+                return true;
+        return false;
+    }
+
+    // e is the same on every iteration, and evaluating it neither faults nor has a side effect
+    bool isInvariant(const(elem)* e)
+    {
+        if (e.Ety & (mTYvolatile | mTYshared))
+            return false;
+        const op = e.Eoper;
+        switch (op)
+        {
+            case OPconst:
+                return true;
+            case OPvar:
+            {
+                const s = e.Vsym;
+                if (s.ty() & (mTYvolatile | mTYshared | mTYthread) || assigned(s))
+                    return false;
+                if (sytab[s.Sclass] & SCRD && s.Sflags & SFLdistinct)
+                    return true;
+                switch (s.Sclass)
+                {
+                    case SC.auto_: case SC.parameter: case SC.regpar: case SC.fastpar:
+                    case SC.shadowreg: case SC.static_: case SC.global: case SC.extern_:
+                    case SC.comdat: case SC.locstat:
+                        return !writesMemory;
+                    default:
+                        return false;
+                }
+            }
+            case OPnot: case OPbool: case OPneg: case OPcom:
+            case OPs16_32: case OPu16_32: case OP32_16: case OPu8_16: case OPs8_16: case OP16_8:
+            case OPu32_64: case OPs32_64: case OP64_32:
+                return tyintegral(e.Ety) && isInvariant(e.E1);
+            case OPadd: case OPmin: case OPmul: case OPand: case OPor: case OPxor:
+            case OPandand: case OPoror:
+                return (tyintegral(e.Ety) || tybasic(e.Ety) == TYbool) &&
+                    isInvariant(e.E1) && isInvariant(e.E2);
+            default:
+                if (OTrel(op))
+                    return isInvariant(e.E1) && isInvariant(e.E2);
+                return false;
+        }
+    }
+
+    static bool hasVar(const(elem)* e)
+    {
+        if (e.Eoper == OPvar)
+            return true;
+        if (OTbinary(e.Eoper))
+            return hasVar(e.E1) || hasVar(e.E2);
+        if (OTunary(e.Eoper))
+            return hasVar(e.E1);
+        return false;
+    }
+
+    // the first branch whose condition is invariant
+    size_t ib = nblocks;
+    elem** pcond;
+    foreach (i, b; blocks[0 .. nblocks])
+    {
+        if (b.bc != BC.iftrue || b.Bsucc.length != 2 || !b.Belem)
+            continue;
+        elem** pn = &b.Belem;
+        while ((*pn).Eoper == OPcomma)
+            pn = &(*pn).E2;
+        const e = *pn;
+        if ((tyintegral(e.Ety) || tybasic(e.Ety) == TYbool) && hasVar(e) && isInvariant(e))
+        {
+            ib = i;
+            pcond = pn;
+            break;
+        }
+    }
+    if (ib == nblocks)
+        return false;
+
+    if (log)
+    {
+        printf("loopunswitch() %s: %d blocks, cost %d, condition ", funcsym_p.Sident.ptr, cast(int)nblocks, cost);
+        WReqn(*pcond);
+        printf("\n");
+    }
+
+    size_t indexOf(const block* b)
+    {
+        foreach (i; 0 .. nblocks)
+            if (blocks[i] is b)
+                return i;
+        assert(0);
+    }
+
+    // the copies go after the last block of the loop in the list of blocks
+    block* last = blocks[0];
+    foreach (b; blocks[1 .. nblocks])
+        for (block* bn = last.Bnext; bn; bn = bn.Bnext)
+            if (bn is b)
+            {
+                last = b;
+                break;
+            }
+    block*[maxBlocks] copies;
+    foreach (i, b; blocks[0 .. nblocks])
+    {
+        b.Bflags |= BFL.unswitched;
+        block* c = block_calloc(bo);
+        c.bc = b.bc;
+        c.Belem = b.Belem ? el_copytree(b.Belem) : null;
+        c.Bsrcpos = b.Bsrcpos;
+        c.Bflags = b.Bflags;
+        c.Bweight = b.Bweight;
+        c.Balign = b.Balign;
+        c.Bnext = last.Bnext;
+        last.Bnext = c;
+        last = c;
+        copies[i] = c;
+    }
+    foreach (i, b; blocks[0 .. nblocks])
+        foreach (s; b.Bsucc[])
+            copies[i].Bsucc.push(inLoop(s) ? copies[indexOf(s)] : s);
+
+    // the preheader tests the condition, choosing the loop where it is true or the copy where it is false
+    elem* cond = *pcond;
+    pre.Belem = el_combine(pre.Belem, el_copytree(cond));
+    pre.bc = BC.iftrue;
+    pre.Bsucc.push(copies[indexOf(head)]);
+
+    elem** pcopy = &copies[ib].Belem;
+    while ((*pcopy).Eoper == OPcomma)
+        pcopy = &(*pcopy).E2;
+    const tym_t ty = cond.Ety;
+    el_free(*pcopy);
+    *pcopy = el_long(ty, 0);
+    el_free(cond);
+    *pcond = el_long(ty, 1);
+
+    ++count;
+    block_pred(bo.startblock);
+    go.changes++;
     return true;
 }
 

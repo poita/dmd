@@ -176,6 +176,7 @@ enum BFL : ushort
     // for Windows NTEXCEPTIONS
     ehcode        = 0x2000, // BC.filter: need to load exception code
     unwind        = 0x4000, // do local_unwind following block (unused)
+    unswitched    = 0x8000, // block of an unswitched loop: do not unswitch again
 }
 
 struct block
