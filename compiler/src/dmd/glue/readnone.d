@@ -192,8 +192,10 @@ struct Checker
 
     bool local(VarDeclaration v)
     {
-        return v && !v.isDataseg() && !v.isField() && !(v.storage_class & (STC.ref_ | STC.out_ | STC.lazy_ | STC.manifest)) &&
-            !v.nestedrefs.length && v.toParent2() is fd && isScalarType(v.type);
+        // The parent is checked first: isDataseg() reports a variable without one, such as __ctfe
+        return v && v.parent && v.toParent2() is fd && !v.isDataseg() && !v.isField() &&
+            !(v.storage_class & (STC.ref_ | STC.out_ | STC.lazy_ | STC.manifest)) &&
+            !v.nestedrefs.length && isScalarType(v.type);
     }
 
     bool exp(Expression e)
