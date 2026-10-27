@@ -4474,9 +4474,10 @@ bool loopunroll(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
 
 /*********************************
  * Unswitch loop `l`: a conditional branch in the loop whose condition is the
- * same on every iteration becomes a test before the loop choosing between two
- * copies of the loop, one for each outcome, in each of which the branch has
- * a constant condition the block optimizer folds away.
+ * same on every iteration, or a choice in an expression (?:, && or ||) whose
+ * first operand is, becomes a test before the loop choosing between two
+ * copies of the loop, one for each outcome, in each of which the condition is
+ * a constant the block and tree optimizers fold away.
  *
  * The condition is evaluated in the preheader, so before the loop runs at
  * all: it is only variables, constants and operators that neither fault nor
@@ -4623,7 +4624,7 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
                 const s = e.Vsym;
                 if (s.ty() & (mTYvolatile | mTYshared | mTYthread) || assigned(s))
                     return false;
-                if (sytab[s.Sclass] & SCRD && s.Sflags & SFLdistinct)
+                if (sytab[s.Sclass] & SCSS && s.Sflags & SFLdistinct)
                     return true;
                 switch (s.Sclass)
                 {
@@ -4661,21 +4662,43 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
         return false;
     }
 
-    // the first branch whose condition is invariant
+    bool isCandidate(const(elem)* e)
+    {
+        return (tyintegral(e.Ety) || tybasic(e.Ety) == TYbool) && hasVar(e) && isInvariant(e);
+    }
+
+    /* The first condition that is invariant: of a conditional branch, or of
+     * a choice within an expression (?:, && and ||), whose first operand is
+     * evaluated first, so takes the value it has on entry to the loop
+     */
+    elem** findCond(elem** pe)
+    {
+        elem* e = *pe;
+        if (OTleaf(e.Eoper))
+            return null;
+        if ((e.Eoper == OPcond || e.Eoper == OPandand || e.Eoper == OPoror) && isCandidate(e.E1))
+            return &e.E1;
+        if (auto p = findCond(&e.E1))
+            return p;
+        return OTbinary(e.Eoper) ? findCond(&e.E2) : null;
+    }
+
     size_t ib = nblocks;
     elem** pcond;
     foreach (i, b; blocks[0 .. nblocks])
     {
-        if (b.bc != BC.iftrue || b.Bsucc.length != 2 || !b.Belem)
+        if (!b.Belem)
             continue;
         elem** pn = &b.Belem;
         while ((*pn).Eoper == OPcomma)
             pn = &(*pn).E2;
-        const e = *pn;
-        if ((tyintegral(e.Ety) || tybasic(e.Ety) == TYbool) && hasVar(e) && isInvariant(e))
+        if (b.bc == BC.iftrue && isCandidate(*pn))
+            pcond = pn;
+        else
+            pcond = findCond(&b.Belem);
+        if (pcond)
         {
             ib = i;
-            pcond = pn;
             break;
         }
     }
@@ -4732,9 +4755,20 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     pre.bc = BC.iftrue;
     pre.Bsucc.push(copies[indexOf(head)]);
 
-    elem** pcopy = &copies[ib].Belem;
-    while ((*pcopy).Eoper == OPcomma)
-        pcopy = &(*pcopy).E2;
+    // the node in copy at the place of p in e, of which copy is a copy
+    static elem** corresponding(elem** pe, elem** pcopy, elem** p)
+    {
+        if (pe is p)
+            return pcopy;
+        elem* e = *pe;
+        if (OTleaf(e.Eoper))
+            return null;
+        if (auto r = corresponding(&e.E1, &(*pcopy).E1, p))
+            return r;
+        return OTbinary(e.Eoper) ? corresponding(&e.E2, &(*pcopy).E2, p) : null;
+    }
+    elem** pcopy = corresponding(&blocks[ib].Belem, &copies[ib].Belem, pcond);
+    assert(pcopy);
     const tym_t ty = cond.Ety;
     el_free(*pcopy);
     *pcopy = el_long(ty, 0);
