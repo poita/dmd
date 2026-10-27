@@ -30,5 +30,6 @@ int main()
     expect("__D5shape6mergedFfZf", 2);
     expect("__D5shape4libmFfZf", 1);
     expect("__D5shape4keptFfZf", 2);
+    expect("__D5shape6storedFfPiZf", 1);
     return failures != 0;
 }

@@ -49,8 +49,17 @@ int throw2(int x)
     return r + throws(x < 0 ? -x : x);
 }
 
+float stored(float a, int* p)
+{
+    const x = scos(a);
+    *p = 1;
+    return x + scos(a);
+}
+
 void main()
 {
+    int w;
+    assert(stored(0.5f, &w) == 2 * cosf(0.5f) && w == 1);
     foreach (i; 0 .. 50)
     {
         const a = i * 0.37f - 7;

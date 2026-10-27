@@ -1569,7 +1569,8 @@ private void defstarkill(ref GlobalOptimizer go)
             switch (op)
             {
                 case OPvar:
-                    if (Symbol_isAffected(*n.Vsym))
+                    // no assignment changes the address of a function
+                    if (Symbol_isAffected(*n.Vsym) && !tyfunc(n.Vsym.ty()))
                         vec_setbit(i,defkill);
                     break;
 
