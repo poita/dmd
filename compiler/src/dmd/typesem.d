@@ -4838,6 +4838,9 @@ Type trySemantic(Type type, Loc loc, Scope* sc)
  */
 Type merge(Type type)
 {
+    if (type.deco)
+        return type;        // already merged
+
     switch (type.ty)
     {
         case Terror:
@@ -4884,9 +4887,6 @@ Type merge(Type type)
     }
 
     //printf("merge(%s)\n", toChars());
-    if (type.deco)
-        return type;
-
     OutBuffer buf;
     buf.reserve(32);
 
