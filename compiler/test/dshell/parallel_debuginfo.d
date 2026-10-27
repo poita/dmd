@@ -2,9 +2,9 @@
 // is split across worker processes: the debug information of every worker's part
 // is in the object file, which dsymutil and lldb read without complaint, and the
 // backtraces of a program linked from it have the file and line of each function,
-// whichever worker generated it. The optimized compilation inlines functions of the
-// other modules, so that the parts have copies of the same weak definitions, which
-// the object file has once.
+// whichever worker generated it. The parts have copies of the same weak definitions
+// (a function literal, and in the optimized compilation functions of other modules
+// inlined), which the object file and the debug information have once.
 module test.dshell.parallel_debuginfo;
 
 import dshell;
@@ -18,7 +18,9 @@ enum modules = 4;
 
 string moduleSource(int k)
 {
-    // each module calls the function of the previous one, the first throws
+    /* Each module calls the function of the previous one, the first throws. Each
+     * part has a copy of the function literal `pick`.
+     */
     return format(q{
 module m%1$d;
 %2$s
@@ -31,7 +33,12 @@ int f%1$d(int x)
     auto r = %3$s;
     return r + twice%1$d(x) + small%1$d(x) + cast(int) [x, 1, 2].length;
 }
-}, k, k ? format("import m%d;", k - 1) : "", k ? format("m%d.f%d(x * 10) + m%d.small%d(x)", k - 1, k - 1, k - 1, k - 1) : "x");
+%4$s
+}, k, k ? format("import m%d; import m0;", k - 1) :
+        "struct Q { int v; }\nalias pick = function int(int a, const Q q) { pragma(inline, false); return q.v + a; };",
+    k ? format("m%d.f%d(x * 10) + m%d.small%d(x) + g%d(x)", k - 1, k - 1, k - 1, k - 1, k) : "x",
+    k ? format("int g%1$d(int x) { return pick(x, Q(x)) + h%1$d(x, Q(2)); }\n" ~
+               "int h%1$d(int a, const Q q) { return q.v * a; }", k) : "");
 }
 
 int check(string flags, string name)
@@ -126,13 +133,13 @@ void main() { f%d(1); }
     }
     const linked = execute(["dwarfdump", "--debug-info", exe ~ ".dSYM"]);
     assert(linked.status == 0, linked.output);
-    foreach (k; 0 .. modules)
+    foreach (fn; ["m0.f0", "m1.f1", "m2.f2", "m3.f3", "m0.__funcliteral_L4_C1"])
     {
-        const n = linked.output.lineSplitter.count!(l => l.canFind(format(`DW_AT_name	("m%d.f%d")`, k, k)));
+        const n = linked.output.lineSplitter.count!(l => l.canFind(`DW_AT_name	("` ~ fn ~ `")`));
         if (n != 1)
         {
             writeln(linked.output);
-            writefln("%s: the dSYM has %d subprograms for m%d.f%d", name, n, k, k);
+            writefln("%s: the dSYM has %d subprograms for %s", name, n, fn);
             return 1;
         }
     }
