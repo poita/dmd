@@ -69,6 +69,7 @@ import dmd.expression;
 import dmd.func;
 import dmd.funcsem : onlyOneMain, isVirtual;
 import dmd.globals;
+import dmd.parallel : stressPause, StressPoint;
 import dmd.hdrgen : toErrMsg;
 import dmd.identifier;
 import dmd.id;
@@ -150,6 +151,7 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
         }
         if (!global.errors && firstm)
         {
+            stressPause(StressPoint.writePart);
             const objname = firstm.objfile.toString();
             obj_end(objbuf, library, !library && outputPartSuffix.length ? objname ~ outputPartSuffix : objname);
         }
@@ -165,6 +167,7 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
                 eSink.message(Loc.initial, "code      %s", m.toChars());
             obj_start(objbuf, m.srcfile.toChars());
             genObjFile(m, multiobj, false);
+            stressPause(StressPoint.writePart);
             obj_end(objbuf, library, m.objfile.toString());
             obj_write_deferred(objbuf, library, glue.obj_symbols_towrite);
             if (global.errors && !writeLibrary)
@@ -195,6 +198,7 @@ public void generateCodeAndWrite(Module[] modules, const(char)*[] libmodules,
         /* Write library to temporary file. If that is successful,
          * then and only then replace the existing file with the temporary file
          */
+        stressPause(StressPoint.writePart);
         auto tmpname = library.filename ~ ".tmp\0";
 
         auto libbuf = OutBuffer(tmpname.ptr);
@@ -239,6 +243,7 @@ public bool mergeLibraries(const(char)[] libfile, const(char)*[] libmodules, con
     if (global.errors)
         return false;
     import dmd.parallel : mergeTemporary;
+    stressPause(StressPoint.merge);
     auto tmpname = mergeTemporary(libfile) ~ "\0";
     auto libbuf = OutBuffer(tmpname.ptr);
     library.writeLibToBuffer(libbuf);

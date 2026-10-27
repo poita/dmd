@@ -7,11 +7,14 @@ templates they all instantiate, so that template instances are shared across
 modules. Each program is then checked by ../splitcheck.py: compiled with -j=1 and
 with -j=2, 3 and 8, to an object file and to a library, with and without
 -O -inline -release, the outputs compared symbol by symbol, and the -j=N outputs
-compiled several times compared byte for byte. The program built from the -j=3
-object file must also print what the one built from the -j=1 object file prints.
+compiled several times compared byte for byte. With --stress K, each -j=N is also
+compiled K times in the compiler's determinism stress mode (see splitcheck.py
+--stress), with seeds that change with the program's seed, and compared byte for
+byte too. The program built from the -j=3 object file must also print what the one
+built from the -j=1 object file prints.
 
 Usage:
-  splitfuzz.py SEEDS [--modules K] [--dmd DMD] [--work DIR] [-j N] [--size SIZE]
+  splitfuzz.py SEEDS [--modules K] [--dmd DMD] [--work DIR] [-j N] [--size SIZE] [--stress K]
 
 SEEDS is a number, a range FROM-TO, or a comma separated list of them. A failing
 seed's program and the checker's report are kept in WORK/fail/split-SEED/. The
@@ -76,8 +79,9 @@ def check(seed, args):
     report = []
     for flags in (['-O', '-inline', '-release'], []):
         for output in (['-c', '-of=all.o'], ['-lib', '-of=all.a']):
-            status, out = run([sys.executable, CHECKER, '-j', '2,3,8', '-r', '2', '--require-split', '--cwd',
-                               directory, '--', args.dmd] + flags + output + files, env=env, timeout=1800)
+            stress = ['--stress', str(args.stress), '--stress-seed', str(seed * 1000 + 1)] if args.stress else []
+            status, out = run([sys.executable, CHECKER, '-j', '2,3,8', '-r', '2', '--require-split'] + stress +
+                              ['--cwd', directory, '--', args.dmd] + flags + output + files, env=env, timeout=1800)
             if status != 0:
                 report.append('splitcheck %s %s:\n%s' % (' '.join(flags), ' '.join(output), out))
         # the program runs the same with the code of either
@@ -116,6 +120,8 @@ def main():
     ap.add_argument('--work', default=os.environ.get('FUZZ_WORK', os.path.join(
         os.environ.get('TMPDIR', '/tmp'), 'dmd-fuzz')))
     ap.add_argument('-j', '--jobs', type=int, default=1)
+    ap.add_argument('--stress', type=int, default=0, metavar='K',
+                    help='compilations of each -j=N in the determinism stress mode')
     args = ap.parse_args()
     os.makedirs(os.path.join(args.work, 'fail'), exist_ok=True)
     failed = 0
