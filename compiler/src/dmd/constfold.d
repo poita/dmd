@@ -955,6 +955,21 @@ UnionExp Cmp(EXP op, Loc loc, Type type, Expression e1, Expression e2)
 UnionExp Cast(Loc loc, Type type, Type to, Expression e1)
 {
     UnionExp ue = void;
+    /* An integer constant cast to another integral type, the commonest cast: the
+     * checks below find no exception (an integral type implicitly converts to
+     * another with at best MATCH.convert), and end in this IntegerExp
+     */
+    if (e1.op == EXP.int64 && type is to)
+    {
+        auto from = e1.type.isTypeBasic();
+        auto tob = to.isTypeBasic();
+        if (from && tob && from.ty != tob.ty && from.ty != Tbool && tob.ty != Tbool &&
+            from.flags & TFlags.integral && tob.flags & TFlags.integral)
+        {
+            emplaceExp!(IntegerExp)(&ue, loc, e1.toInteger(), type);
+            return ue;
+        }
+    }
     Type tb = to.toBasetype();
     Type typeb = type.toBasetype();
     //printf("Cast(type = %s, to = %s, e1 = %s)\n", type.toChars(), to.toChars(), e1.toChars());
