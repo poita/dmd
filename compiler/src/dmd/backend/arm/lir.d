@@ -9214,6 +9214,8 @@ private bool ifConvertBranches()
         // out of loops only a choice between values made already, which a select is cheaper than
         if (!inLoop[s])
         {
+            if (env!"DMD_NEWCG_NOIFCONVOUT")
+                continue;
             foreach (k; 0 .. 2)
             {
                 const Way w = k ? wt : wf;
