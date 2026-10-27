@@ -390,7 +390,10 @@ bool lirCodegen(ref CGstate cg)
             if (!env!"DMD_NEWCG_NODOMTEST")
                 foldDominatedTests(false);
             removeUnreachable();
-            ifConvertBranches();
+            // a conversion's join may start the next if, converted in the next round
+            foreach (_; 0 .. 16)
+                if (!ifConvertBranches())
+                    break;
         }
         removeRedundantExtensions();
         if (!env!"DMD_NEWCG_NOCOPYPROP")
@@ -9003,12 +9006,12 @@ private void removeConstantBoundsChecks()
  * ways done, and selects of the values the copies give
  */
 @trusted
-private void ifConvertBranches()
+private bool ifConvertBranches()
 {
     buildSegments();
     const ns = segStart.length - 1;
     if (ns < 3)
-        return;
+        return false;
     Barray!uint predStart, preds;
     Barray!Loop loops;
     findLoops(predStart, preds, loops);
@@ -9025,7 +9028,7 @@ private void ifConvertBranches()
         loops.dtor(); preds.dtor(); predStart.dtor(); ndefs.dtor(); nuses.dtor(); inLoop.dtor(); inserts.dtor();
     }
     if (!loops.length)
-        return;
+        return false;
     inLoop.setLength(ns);
     inLoop[][] = false;
     foreach (ref lp; loops[])
@@ -9160,9 +9163,10 @@ private void ifConvertBranches()
     Barray!Sel sels;
     scope (exit) sels.dtor();
 
+    bool again;     // an if left for a round after this one, as a segment of it is changed here
     foreach (uint s; 0 .. cast(uint)ns - 2)
     {
-        if (!inLoop[s] || used[s])
+        if (!inLoop[s])
             continue;
         const send = segEnd(s);
         if (send <= segStart[s])
@@ -9170,6 +9174,11 @@ private void ifConvertBranches()
         LIns* br = &ins[send - 1];
         if (br.op != LOp.bcond)
             continue;
+        if (used[s])
+        {
+            again = true;
+            continue;
+        }
         const target = br.flags & F.toLabel ? labelSeg[br.target] : blockSeg[br.target];
         if (target <= s + 1)
             continue;
@@ -9179,6 +9188,8 @@ private void ifConvertBranches()
         while (true)
         {
             const v = wf.b;
+            if (v < target && used[v])
+                again = true;
             if (v >= target || used[v] || !onlyPred(v, v == wf.a ? s : v - 1))
                 break;
             const e = segEnd(v);
@@ -9211,6 +9222,7 @@ private void ifConvertBranches()
             while (wt.b < join)
             {
                 const v = wt.b;
+                again |= used[v];
                 if (used[v] || !onlyPred(v, v == wt.a ? s : v - 1) || !onlySucc(v, v + 1))
                     break;
                 wt.b = v + 1;
@@ -9346,7 +9358,9 @@ private void ifConvertBranches()
             inserts.push(Insert(segStart[join], c, false));
         }
     }
+    const changed = inserts.length != 0;
     applyInserts(inserts);
+    return changed && again;
 }
 
 /* Remove the code of the segments nothing reaches, and the branches to labels
@@ -11427,6 +11441,9 @@ private enum Neon : uint
     shl2d = 0x4F405400,                         // | shift << 16
     ushr2d = 0x6F000400, sshr2d = 0x4F000400,   // | (128 - shift) << 16
     addp2d = 0x5EF1B800,        // ADDP Dd,Vn.2D
+    // between 4 lanes of 32 bits and two vectors of 2 lanes of 64 bits
+    sxtl2d = 0x0F20A400, sxtl2_2d = 0x4F20A400, uxtl2d = 0x2F20A400, uxtl2_2d = 0x6F20A400,
+    uzp1_4s = 0x4E801800,       // the low 32 bits of the 64 bit lanes of Vn, then of Vm
 }
 
 /* The form on 2 lanes of 64 bits of the instruction on 4 lanes of 32 bits templ,
@@ -11477,6 +11494,10 @@ private struct LvVal
     ubyte sz;           // it reads, with their condition
     int oa = -1, ob = -1, fl = -1;
     ubyte cond;
+    ubyte iflags;       // lanes: the flags of the operation, and its immediate
+    long imm;
+    Reg wlo, whi;       // lanes of 4 lanes of 32 bits: the 64 bit values of lanes 0 and 1, and 2 and 3, once made
+    int carryOf = -1;   // lanes: the reduction whose value at the start of an iteration this is
 }
 
 /// A part of affine values the same in every iteration: the register r, a + b, a * m,
@@ -11521,6 +11542,7 @@ private struct LvCarry
     bool zeroLanes;     // reduction: lanes 1 .. 3 start at zero, not as lane 0
     int of = -1;        // reduction: the index in carry of the minimum or maximum this is the first index of
     bool signedIndex;   // reduction of an index: the index is signed
+    Reg acc2;           // reduction of 64 bit values in 4 lanes: the vector of lanes 2 and 3, acc of 0 and 1
 }
 
 /// An operation on lanes, by what it does to what
@@ -11548,6 +11570,8 @@ private struct LoopVec
     Barray!long splatOf;
     Barray!Reg iotas;           // by step in iotaOf: the vector of 0, 1, 2 and 3 steps
     Barray!long iotaOf;
+    Barray!Reg splats64;        // by constant in splat64Of: its vector of 2 lanes of 64 bits
+    Barray!long splat64Of;
     Reg zero;                   // the vector of zeros, once made
     int curFlags = -1;
     uint nregs;                 // the registers there were before
@@ -11569,6 +11593,7 @@ private struct LoopVec
         valOf.dtor(); touched.dtor(); vals.dtor(); terms.dtor(); flags.dtor(); mems.dtor(); carry.dtor();
         pre.dtor(); body.dtor(); checks.dtor(); ndefs.dtor(); defIns.dtor(); inLoop.dtor(); seen.dtor();
         splat.dtor(); splatOf.dtor(); iotas.dtor(); iotaOf.dtor(); cse.dtor(); offsets.dtor(); loaded.dtor();
+        splats64.dtor(); splat64Of.dtor();
     }
 
     void reset()
@@ -11579,6 +11604,7 @@ private struct LoopVec
         vals.setLength(0); terms.setLength(0); flags.setLength(0); mems.setLength(0); carry.setLength(0);
         pre.setLength(0); body.setLength(0); checks.setLength(0);
         splat.setLength(0); splatOf.setLength(0); iotas.setLength(0); iotaOf.setLength(0);
+        splats64.setLength(0); splat64Of.setLength(0);
         cse.setLength(0);
         offsets.setLength(0);
         loaded.setLength(0);
@@ -11799,7 +11825,7 @@ private struct LoopVec
 
     static struct NoWrap { Reg start; long c; bool signed; int v; }
     static struct Offset { int v; ubyte ext, shift; Reg r; }
-    static struct Loaded { int term; long k; ubyte size; bool signed; int val; }
+    static struct Loaded { int term; long k; ubyte size; bool signed, toX; int val; }
     Barray!Loaded loaded;       // the vector loads since the last store
     Barray!Offset offsets;      // the offsets in bytes of the indices of memory accesses, in the vector loop
     Barray!NoWrap noWrap;
@@ -11818,7 +11844,17 @@ private struct LoopVec
     {
         auto x = &vals[v];
         if (x.kind == LvVal.Kind.lanes)
+        {
+            if (!x.body)
+            {
+                // only its 64 bit lanes are made: their low 32 bits
+                Reg r = newVreg(RC.fp, 16);
+                emitTo(body, LOp.vq, 16, r, x.wlo, x.whi, Neon.uzp1_4s);
+                vals[v].body = r;
+                return r;
+            }
             return x.body;
+        }
         if (x.vec)
             return x.vec;
         Reg r;
@@ -11908,6 +11944,253 @@ private struct LoopVec
         iotas.push(r);
         iotaOf.push(c);
         return r;
+    }
+
+    // the vector of the 64 bit constant c in both lanes
+    @trusted Reg splat64(long c)
+    {
+        foreach (n, s; splat64Of[])
+            if (s == c)
+                return splats64[n];
+        Reg r = newVreg(RC.fp, 16);
+        if (c == 0)
+            emitTo(pre, LOp.vq, 16, r, noReg, noReg, Neon.movi0);
+        else
+        {
+            Reg g = newVreg(RC.gp, 8);
+            emitTo(pre, LOp.movi, 8, g, noReg, noReg, c);
+            emitTo(pre, LOp.vqg, 16, r, g, noReg, Neon.dup2dX);
+        }
+        splats64.push(r);
+        splat64Of.push(c);
+        return r;
+    }
+
+    // the 64 bit op templ (a 4 lane form) on the pairs of vectors a and b
+    void pairOp(uint templ, Reg[2] a, Reg[2] b, out Reg lo, out Reg hi)
+    {
+        lo = newVreg(RC.fp, 16);
+        hi = newVreg(RC.fp, 16);
+        emitTo(body, LOp.vq, 16, lo, a[0], b[0], lanes64(templ));
+        emitTo(body, LOp.vq, 16, hi, a[1], b[1], lanes64(templ));
+    }
+
+    // the 32 bit lanes r, zero or sign extended to 64 bits as two vectors
+    void widenLanes(Reg r, bool signed, out Reg lo, out Reg hi)
+    {
+        lo = newVreg(RC.fp, 16);
+        hi = newVreg(RC.fp, 16);
+        emitTo(body, LOp.vq, 16, lo, r, noReg, signed ? Neon.sxtl2d : Neon.uxtl2d);
+        emitTo(body, LOp.vq, 16, hi, r, noReg, signed ? Neon.sxtl2_2d : Neon.uxtl2_2d);
+    }
+
+    /* The 64 bit values of the 4 lanes of value v in the vector loop, as the vectors
+     * lo of lanes 0 and 1 and hi of lanes 2 and 3; false if they are not made
+     */
+    @trusted bool pairOf(int v, out Reg lo, out Reg hi)
+    {
+        assert(!d64);
+        auto x = &vals[v];
+        if (x.wlo)
+        {
+            lo = x.wlo;
+            hi = x.whi;
+            return true;
+        }
+        if (x.kind == LvVal.Kind.uni)
+        {
+            if (x.isConst)
+                lo = hi = splat64(x.cval);
+            else
+            {
+                if (rcOf(x.pre) != RC.gp)
+                    return no("wide value");
+                // a 32 bit register holds its value zero extended
+                lo = hi = newVreg(RC.fp, 16);
+                emitTo(pre, LOp.vqg, 16, lo, x.pre, noReg, Neon.dup2dX);
+            }
+        }
+        else if (x.kind == LvVal.Kind.aff)
+        {
+            if (x.w == 4)
+                widenLanes(lanesOf(v), false, lo, hi);
+            else
+            {
+                // lane 0 and c more in each lane after: + 0, c and + 2c, 3c
+                const long c = x.c;
+                Reg d = newVreg(RC.fp, 16);
+                emitTo(body, LOp.vqg, 16, d, x.body, noReg, Neon.dup2dX);
+                Reg s01 = newVreg(RC.fp, 16), s23 = newVreg(RC.fp, 16);
+                Reg z = splat64(0), c1 = splat64(c), c2 = splat64(2 * c), c3 = splat64(3 * c);
+                emitTo(pre, LOp.vq, 16, s01, z, c1, Neon.zip1_2d);
+                emitTo(pre, LOp.vq, 16, s23, c2, c3, Neon.zip1_2d);
+                pairOp(Neon.add4s, [d, d], [s01, s23], lo, hi);
+            }
+        }
+        else
+        {
+            if (x.carryOf >= 0)
+            {
+                auto c = &carry[x.carryOf];
+                if (!c.acc2)
+                    c.acc2 = newVreg(RC.fp, 16);
+                lo = c.acc;
+                hi = c.acc2;
+            }
+            else if (x.op >= LOp.fadd && x.op <= LOp.fcvt)
+                return no("wide float");
+            else if (x.op == LOp.ld)
+                // a load to an X register extends to 64 bits, to a W register to 32
+                widenLanes(lanesOf(v), (x.iflags & (F.signed | F.toX)) == (F.signed | F.toX), lo, hi);
+            else if (x.sz == 4 && x.op != LOp.copy)
+                widenLanes(lanesOf(v), false, lo, hi);
+            else
+            {
+                Reg[2] a, b;
+                bool opA() { return x.oa >= 0 && pairOf(x.oa, a[0], a[1]); }
+                bool opB() { return x.ob >= 0 && pairOf(x.ob, b[0], b[1]); }
+                switch (x.op)
+                {
+                    case LOp.copy:
+                        if (!opA())
+                            return false;
+                        lo = a[0]; hi = a[1];
+                        break;
+                    case LOp.sext, LOp.zext:
+                        if (x.imm >= 64)
+                        {
+                            if (!opA())
+                                return false;
+                            lo = a[0]; hi = a[1];
+                        }
+                        else if (x.imm == 32)
+                            widenLanes(lanesOf(x.oa), x.op == LOp.sext, lo, hi);
+                        else
+                            widenLanes(lanesOf(v), x.op == LOp.sext, lo, hi);    // of 8 or 16 bits, in the low 32
+                        break;
+                    case LOp.add, LOp.sub, LOp.and_, LOp.orr, LOp.eor:
+                    {
+                        if (!opA() || !opB())
+                            return false;
+                        if (x.iflags & F.shifted)
+                        {
+                            // LSL, LSR or ASR
+                            if (x.cond > 2 || x.imm >= 64)
+                                return no("wide shifted operand");
+                            const n = cast(uint)x.imm;
+                            const templ = x.cond == 0 ? Neon.shl2d | n << 16
+                                                      : (x.cond == 2 ? Neon.sshr2d : Neon.ushr2d) | (128 - n) << 16;
+                            if (n)
+                                foreach (h; 0 .. 2)
+                                {
+                                    Reg r = newVreg(RC.fp, 16);
+                                    emitTo(body, LOp.vq, 16, r, b[h], noReg, templ);
+                                    b[h] = r;
+                                }
+                        }
+                        static immutable uint[5] t = [Neon.add4s, Neon.sub4s, Neon.and16b, Neon.orr16b, Neon.eor16b];
+                        const k = x.op == LOp.add ? 0 : x.op == LOp.sub ? 1 : x.op == LOp.and_ ? 2 : x.op == LOp.orr ? 3 : 4;
+                        pairOp(t[k], a, b, lo, hi);
+                        break;
+                    }
+                    case LOp.addi, LOp.subi, LOp.andi, LOp.orri, LOp.eori:
+                    {
+                        if (!opA())
+                            return false;
+                        static immutable uint[5] t = [Neon.add4s, Neon.sub4s, Neon.and16b, Neon.orr16b, Neon.eor16b];
+                        const k = x.op == LOp.addi ? 0 : x.op == LOp.subi ? 1 : x.op == LOp.andi ? 2 : x.op == LOp.orri ? 3 : 4;
+                        Reg c = splat64(x.imm);
+                        pairOp(t[k], a, [c, c], lo, hi);
+                        break;
+                    }
+                    case LOp.lsli, LOp.lsri, LOp.asri:
+                        if (!opA())
+                            return false;
+                        if (x.imm == 0)
+                        {
+                            lo = a[0]; hi = a[1];
+                        }
+                        else if (x.imm >= 64)
+                            lo = hi = splat64(0);
+                        else
+                        {
+                            const n = cast(uint)x.imm;
+                            const templ = x.op == LOp.lsli ? Neon.shl2d | n << 16
+                                                           : (x.op == LOp.asri ? Neon.sshr2d : Neon.ushr2d) | (128 - n) << 16;
+                            lo = newVreg(RC.fp, 16);
+                            hi = newVreg(RC.fp, 16);
+                            emitTo(body, LOp.vq, 16, lo, a[0], noReg, templ);
+                            emitTo(body, LOp.vq, 16, hi, a[1], noReg, templ);
+                        }
+                        break;
+                    case LOp.lslv, LOp.lsrv, LOp.asrv:
+                    {
+                        if (!opA() || !opB())
+                            return false;
+                        // by the amount modulo 64, to the right as a negative shift left
+                        Reg m = splat64(63);
+                        Reg n0, n1;
+                        pairOp(Neon.and16b, b, [m, m], n0, n1);
+                        Reg[2] n = [n0, n1];
+                        if (x.op != LOp.lslv)
+                        {
+                            Reg z = splat64(0);
+                            pairOp(Neon.sub4s, [z, z], n, n0, n1);
+                            n = [n0, n1];
+                        }
+                        pairOp(x.op == LOp.asrv ? Neon.sshl4s : Neon.ushl4s, a, n, lo, hi);
+                        break;
+                    }
+                    case LOp.neg, LOp.mvn:
+                    {
+                        if (!opA())
+                            return false;
+                        if (x.op == LOp.mvn)
+                        {
+                            Reg c = splat64(-1);
+                            pairOp(Neon.eor16b, a, [c, c], lo, hi);
+                        }
+                        else
+                        {
+                            Reg z = splat64(0);
+                            pairOp(Neon.sub4s, [z, z], a, lo, hi);
+                        }
+                        break;
+                    }
+                    case LOp.csel:
+                    {
+                        Reg m;
+                        bool inv;
+                        if (x.fl < 0 || flags[x.fl].sz != 4 || !mask(x.fl, x.cond, m, inv) || !opA() || !opB())
+                            return no("wide select");
+                        Reg m0, m1;
+                        widenLanes(m, true, m0, m1);
+                        Reg[2] ms = [m0, m1];
+                        Reg[2] r;
+                        foreach (h; 0 .. 2)
+                        {
+                            r[h] = newVreg(RC.fp, 16);
+                            LIns s;
+                            s.op = LOp.vbsl;
+                            s.sz = 16;
+                            s.d = r[h];
+                            s.a = ms[h];
+                            s.b = inv ? b[h] : a[h];
+                            s.c = inv ? a[h] : b[h];
+                            body.push(s);
+                        }
+                        lo = r[0]; hi = r[1];
+                        break;
+                    }
+                    default:
+                        return no("wide operation");
+                }
+            }
+        }
+        x = &vals[v];
+        x.wlo = lo;
+        x.whi = hi;
+        return true;
     }
 
     // templ, a 4 lane form or a shift by shlBy or shrBy, on a and b in the vector loop
@@ -12333,15 +12616,16 @@ private struct LoopVec
                 if (rcOf(i.d) == RC.fp && i.sz != (d64 ? 8 : 4))
                     return no("load size");
                 // the lanes of a load of the same since the last store
-                const signedLoad = (i.flags & F.signed) != 0;
+                // the extension to 32 or 64 bits as well, which the 64 bit lanes of a load are made by
+                const signedLoad = (i.flags & F.signed) != 0, toX = (i.flags & F.toX) != 0;
                 foreach (ref x; loaded[])
-                    if (x.term == t && x.k == k && x.size == i.sz && x.signed == signedLoad)
+                    if (x.term == t && x.k == k && x.size == i.sz && x.signed == signedLoad && x.toX == toX)
                     {
                         setVal(i.d, x.val);
                         return true;
                     }
                 scope (success)
-                    loaded.push(Loaded(t, k, i.sz, signedLoad, valOf[i.d - firstVreg]));
+                    loaded.push(Loaded(t, k, i.sz, signedLoad, toX, valOf[i.d - firstVreg]));
                 mems.push(LvMem(false, false, i.sz, t, c, k, pa));
                 long off;
                 const vsz = i.sz * lanes;
@@ -12360,7 +12644,9 @@ private struct LoopVec
                     r = vop(signed ? Neon.sxtl8h : Neon.uxtl8h, r);
                 if (i.sz <= 2)
                     r = vop(signed ? Neon.sxtl4s : Neon.uxtl4s, r);
-                setVal(i.d, lanesVal(r, LOp.ld, i.sz, -1, -1));
+                const n = lanesVal(r, LOp.ld, i.sz, -1, -1);
+                vals[n].iflags = i.flags;
+                setVal(i.d, n);
                 return true;
             }
 
@@ -12572,7 +12858,9 @@ private struct LoopVec
                 Reg b = B();
                 if (i.flags & F.shifted)
                 {
-                    if (wide && i.cond != 0 || i.imm >= bits)
+                    if (wide && (i.cond != 0 || i.imm >= bits))
+                        return pairOnly(i, va, vb);
+                    if (i.imm >= bits)
                         return no("shifted operand");
                     if (i.imm)
                         b = vop(i.cond == 0 ? shlBy(cast(uint)i.imm) : shrBy(i.cond != 1, cast(uint)i.imm), b);
@@ -12604,7 +12892,7 @@ private struct LoopVec
             }
             case LOp.lsli, LOp.lsri, LOp.asri:
                 if (i.op != LOp.lsli && wide)
-                    return no("wide shift");
+                    return pairOnly(i, va, vb);
                 if (i.imm == 0)
                     r = A();
                 else if (i.imm >= bits)
@@ -12615,7 +12903,7 @@ private struct LoopVec
             case LOp.lslv, LOp.lsrv, LOp.asrv:
             {
                 if (wide)
-                    return no("wide shift");
+                    return pairOnly(i, va, vb);
                 // by the amount modulo 32, to the right as a negative shift left
                 Reg n = vop(Neon.and16b, B(), splatConst(bits - 1));
                 if (i.op != LOp.lslv)
@@ -12694,7 +12982,27 @@ private struct LoopVec
             default:
                 return no("lane operation");
         }
-        setVal(i.d, lanesVal(r, i.op, i.sz, va, vb));
+        const n = lanesVal(r, i.op, i.sz, va, vb);
+        vals[n].iflags = i.flags;
+        vals[n].cond = i.cond;
+        vals[n].imm = i.imm;
+        setVal(i.d, n);
+        return true;
+    }
+
+    /* The 64 bit operation i in 4 lanes, whose low 32 bits are not made from those of
+     * its operands: made as two vectors of 64 bit lanes
+     */
+    @trusted bool pairOnly(ref LIns i, int va, int vb)
+    {
+        const n = lanesVal(noReg, i.op, i.sz, va, vb);
+        vals[n].iflags = i.flags;
+        vals[n].cond = i.cond;
+        vals[n].imm = i.imm;
+        Reg lo, hi;
+        if (!pairOf(n, lo, hi))
+            return no("wide shift");
+        setVal(i.d, n);
         return true;
     }
 }
@@ -13004,6 +13312,8 @@ private bool vectorizeLoops()
                     c.acc = newVreg(RC.fp, 16);
                     x.body = c.acc;
                 }
+                if (!c.induction)
+                    x.carryOf = cast(int)(&c - lv.carry[].ptr);
                 const n = lv.newVal(x);
                 if (!c.induction)
                     c.phi = n;
@@ -13076,7 +13386,9 @@ private bool vectorizeLoops()
                 const F = lv.valOf[c.r - firstVreg];
                 const(LvVal)* x = &lv.vals[F];
                 const lsz = lv.d64 ? 8 : 4;
-                if (F == P || x.kind != LvVal.Kind.lanes || x.uses || x.sz != lsz)
+                // of 64 bit values in 4 lanes, in two vectors of 2 lanes
+                const wideRed = !lv.d64 && x.sz == 8;
+                if (F == P || x.kind != LvVal.Kind.lanes || x.uses || x.sz != lsz && !wideRed)
                     return fails("reduction");
                 auto pu = lv.vals[P].uses;
                 /* a select of P op Y, made only for it, and P, from a comparison not of
@@ -13087,7 +13399,7 @@ private bool vectorizeLoops()
                 {
                     const Z = x.oa == P ? x.ob : x.oa;
                     const z = &lv.vals[Z];
-                    if (Z >= 0 && z.kind == LvVal.Kind.lanes && z.uses == 1 && z.sz == lsz && pu == 2 &&
+                    if (Z >= 0 && z.kind == LvVal.Kind.lanes && z.uses == 1 && z.sz == x.sz && pu == 2 &&
                         (z.op == LOp.add || z.op == LOp.sub || z.op == LOp.orr || z.op == LOp.eor ||
                          z.op == LOp.and_ || z.op == LOp.addi || z.op == LOp.subi))
                     {
@@ -13105,8 +13417,16 @@ private bool vectorizeLoops()
                         if (x.op == LOp.and_ || x.op == LOp.orr || x.op == LOp.eor)
                             c.red = x.op;
                         else
-                            c.red = lv.d64 ? Neon.addp2d : Neon.addv;
+                            c.red = lv.d64 || wideRed ? Neon.addp2d : Neon.addv;
                         c.zeroLanes = x.op != LOp.and_ && x.op != LOp.orr;
+                        if (wideRed)
+                        {
+                            Reg lo, hi;
+                            if (!lv.pairOf(F, lo, hi))
+                                return fails(lv.why);
+                            if (!c.acc2)
+                                c.acc2 = newVreg(RC.fp, 16);
+                        }
                         break;
                     }
                     case LOp.csel:
@@ -13118,7 +13438,7 @@ private bool vectorizeLoops()
                             if (c2.of >= 0 && &lv.carry[c2.of] == &c)
                                 indexed = true;
                         // no minimum or maximum across 64 bit lanes
-                        if (lv.d64 || pu != 2 || f.uses != (indexed ? 2 : 1) || f.op != LOp.cmp || f.sz != 4)
+                        if (lv.d64 || wideRed || pu != 2 || f.uses != (indexed ? 2 : 1) || f.op != LOp.cmp || f.sz != 4)
                             return fails("reduction");
                         const Y = x.oa == P ? x.ob : x.oa;
                         if (Y == P || !(f.a == P && f.b == Y || f.a == Y && f.b == P))
@@ -13160,6 +13480,10 @@ private bool vectorizeLoops()
                         return fails("reduction");
                 }
             }
+
+            foreach (ref c; lv.carry[])
+                if (c.acc2 && (c.induction || lv.vals[lv.valOf[c.r - firstVreg]].sz != 8 || !lv.vals[lv.valOf[c.r - firstVreg]].wlo))
+                    return fails("wide reduction");
 
             /* the code goes at the end of the preheader, branching to the scalar loop's
              * header and the block after the loop: a branch to a label goes no further
@@ -13336,8 +13660,20 @@ private bool vectorizeLoops()
                 }
             // the reductions' lanes, and where the vector loop ends
             foreach (ref c; lv.carry[])
-                if (!c.induction)
+            {
+                if (c.induction)
+                    continue;
+                if (c.acc2)
+                {
+                    LoopVec.emitTo(code, LOp.vqg, 16, c.acc, c.r, noReg, c.zeroLanes ? Neon.fmovDX : Neon.dup2dX);
+                    if (c.zeroLanes)
+                        LoopVec.emitTo(code, LOp.vq, 16, c.acc2, noReg, noReg, Neon.movi0);
+                    else
+                        LoopVec.emitTo(code, LOp.vqg, 16, c.acc2, c.r, noReg, Neon.dup2dX);
+                }
+                else
                     LoopVec.emitTo(code, LOp.vqg, 16, c.acc, c.r, noReg, lv.t(c.zeroLanes ? Neon.fmovSW : Neon.dup4sW));
+            }
             Reg c4 = newVreg(RC.gp, w), vend = newVreg(RC.gp, w);
             if (known >= 0)
                 LoopVec.emitTo(code, LOp.movi, w, c4, noReg, noReg, known & ~(L - 1L));
@@ -13359,6 +13695,12 @@ private bool vectorizeLoops()
             {
                 if (c.induction)
                     LoopVec.addImm(code, c.w, c.r, c.r, L * c.step);
+                else if (c.acc2)
+                {
+                    const x = &lv.vals[lv.valOf[c.r - firstVreg]];
+                    LoopVec.emitTo(code, LOp.copy, 16, c.acc, x.wlo);
+                    LoopVec.emitTo(code, LOp.copy, 16, c.acc2, x.whi);
+                }
                 else
                     LoopVec.emitTo(code, LOp.copy, 16, c.acc, lv.vals[lv.valOf[c.r - firstVreg]].body);
             }
@@ -13370,12 +13712,22 @@ private bool vectorizeLoops()
             {
                 if (c.induction || c.of >= 0)
                     continue;
+                Reg acc = c.acc;
+                if (c.acc2)
+                {
+                    // the two vectors of 2 lanes as one
+                    acc = newVreg(RC.fp, 16);
+                    const uint op = c.red == LOp.and_ ? Neon.and16b : c.red == LOp.orr ? Neon.orr16b :
+                                    c.red == LOp.eor ? Neon.eor16b : lanes64(Neon.add4s);
+                    LoopVec.emitTo(code, LOp.vq, 16, acc, c.acc, c.acc2, op);
+                }
+                const d64 = lv.d64 || c.acc2;
                 if (c.red == LOp.and_ || c.red == LOp.orr || c.red == LOp.eor)
                 {
                     Reg x = newVreg(RC.gp, 8), y = newVreg(RC.gp, 8), z = newVreg(RC.gp, 8), t = newVreg(RC.gp, 8);
-                    LoopVec.emitTo(code, LOp.vgq, 8, x, c.acc, noReg, Neon.fmovXD);
-                    LoopVec.emitTo(code, LOp.vgq, 8, y, c.acc, noReg, Neon.umovXD1);
-                    if (lv.d64)
+                    LoopVec.emitTo(code, LOp.vgq, 8, x, acc, noReg, Neon.fmovXD);
+                    LoopVec.emitTo(code, LOp.vgq, 8, y, acc, noReg, Neon.umovXD1);
+                    if (d64)
                         LoopVec.emitTo(code, cast(LOp)c.red, 8, c.r, x, y);
                     else
                     {
@@ -13387,8 +13739,8 @@ private bool vectorizeLoops()
                 else
                 {
                     Reg s = newVreg(RC.fp, 16);
-                    LoopVec.emitTo(code, LOp.vq, 16, s, c.acc, noReg, c.red);
-                    if (lv.d64)
+                    LoopVec.emitTo(code, LOp.vq, 16, s, acc, noReg, c.red);
+                    if (d64)
                         LoopVec.emitTo(code, LOp.vgq, 8, c.r, s, noReg, Neon.fmovXD);
                     else
                         LoopVec.emitTo(code, LOp.vgq, 4, c.r, s, noReg, Neon.fmovWS);
