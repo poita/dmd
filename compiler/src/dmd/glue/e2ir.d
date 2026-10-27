@@ -24,6 +24,7 @@ import dmd.root.stringtable;
 
 import dmd.glue;
 import dmd.glue.objc;
+import dmd.glue.readnone;
 import dmd.glue.s2ir;
 import dmd.glue.tocsym;
 import dmd.glue.toctype;
@@ -6207,6 +6208,8 @@ elem* callfunc(Loc loc,
             e = el_una(OPucall, tyret, ec);
         if (hiddenLast && irs.target.isAArch64)
             e.Nflags |= NFLhidden;
+        else if (fd && !ethis && !ethis2 && ec.Eoper == OPvar && isReadNone(fd))
+            e.Nflags |= NFLreadnone;
 
         if (tf.parameterList.varargs != VarArg.none)
         {

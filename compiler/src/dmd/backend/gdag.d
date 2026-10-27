@@ -409,7 +409,8 @@ private void aewalk(ref GlobalOptimizer go, ref elem* pn, vec_t ae)
             }
     }
 
-    if (OTdef(op))
+    // A read-none call numbered as an AE defines nothing
+    if (OTdef(op) && !(n.Eexp && isReadNoneCall(n)))
     {
         assert(n.Eexp == 0);   // should not be an AE
         /* remove all AEs that could be affected by this def    */
@@ -900,7 +901,7 @@ private void abewalk(ref GlobalOptimizer go, elem* n, vec_t ae, vec_t aeval, ref
             break;
     }
 
-    if (OTdef(op))
+    if (OTdef(op) && !(n.Eexp && isReadNoneCall(n)))
     {
         assert(n.Eexp == 0);           // should not be an AE
         /* remove all AEs that could be affected by this def    */

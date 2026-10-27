@@ -350,6 +350,9 @@ void ecom(ref CGCS cgcs, ref elem* pe)
         case OPucall:
         case OPucallns:
             ecom(cgcs, e.E1);
+            // A read-none call touches nothing and is a candidate like an operator
+            if (isReadNoneCall(e))
+                break;
             touchfunc(cgcs, 1);
             return;
 
