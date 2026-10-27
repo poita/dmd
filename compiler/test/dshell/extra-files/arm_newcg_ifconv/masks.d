@@ -20,8 +20,20 @@ uint lowBits(const ref ubyte b)
     return b & 0x7F;
 }
 
+struct Table { ubyte[8] t; }
+
+// p is extended once, as it comes in: the byte chosen, loaded or p, is not again
+ubyte ext1_pick(ref const Table s, ubyte p) @safe
+{
+    return p < s.t.length ? s.t[p] : p;
+}
+
 void main()
 {
+    Table tb;
+    tb.t[3] = 200;
+    if (ext1_pick(tb, 3) != 200 || ext1_pick(tb, 9) != 9 || ext1_pick(tb, 0) != 0)
+        assert(0);
     if (!ops3_orEquals(3) || ops3_orEquals(4))
         assert(0);
     ubyte b = 0xF3;

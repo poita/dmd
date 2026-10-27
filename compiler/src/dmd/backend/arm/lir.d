@@ -7726,6 +7726,8 @@ private void removeRedundantExtensions()
         uint n;
         switch (i.op)
         {
+            case LOp.nop:
+                return 0;       // where a value the code goes on to set on each way is defined
             case LOp.ld:
                 if (i.flags & F.signed)
                     return i.flags & F.toX || i.sz >= 4 && i.sz != 4 ? 64 : 32;
