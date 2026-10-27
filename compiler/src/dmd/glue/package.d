@@ -645,6 +645,30 @@ private SplitGroup instanceGroup(TemplateInstance ti)
     return g;
 }
 
+/* Returns: the worker generating the group of template instance `ti`, as
+ * `instanceGroup(ti).pinned` does, without the group's name, which takes mangling
+ */
+private int instancePinned(TemplateInstance ti)
+{
+    import dmd.parallel : abandonSplit, instanceWorker, moduleWorker, thisWorker;
+
+    if (auto f = enclosingFunction(ti))
+    {
+        auto root = frameRoot(f);
+        if (auto rti = root.isInstantiated())
+            return instancePinned(rti);
+        return root.isFuncLiteralDeclaration() ? -1 : moduleWorker(root.getModule());
+    }
+    int pinned = instanceWorker(ti);
+    if (pinned < 0 && !global.params.multiobj && instanceRegisters(ti))
+    {
+        pinned = ti.memberOf ? moduleWorker(ti.memberOf) : -1;
+        if (pinned != thisWorker())
+            abandonSplit("runs with a module another worker generates", instanceName(ti));
+    }
+    return pinned;
+}
+
 /// Returns: the function template instance `ti` is nested in, or the function its
 /// template is declared in, if any
 private FuncDeclaration enclosingFunction(TemplateInstance ti)
@@ -904,9 +928,10 @@ bool instanceGeneratedHere(TemplateInstance ti)
 
     if (!inSplitWorker())
         return true;
-    auto g = instanceGroup(ti);
-    if (g.pinned >= 0 && g.pinned != thisWorker())
+    const pinned = instancePinned(ti);
+    if (pinned >= 0 && pinned != thisWorker())
         return false;   // the worker generating it walks the modules' instances too
+    auto g = instanceGroup(ti);
     const name = g.head is ti ? g.name : instanceName(ti);
     if (!generatesHere(ti, name, g, g.head is ti || canGenerate(g.head)))
         return false;
@@ -929,7 +954,7 @@ private void generatePlannedInstances(bool multiobj)
         foreach (s; (*o.m.members)[0 .. o.membersAtSplit])
         {
             auto ti = s.isTemplateInstance();
-            if (ti && !isError(ti) && ti.members && ti.needsCodegen() && instanceGroup(ti).pinned == thisWorker())
+            if (ti && !isError(ti) && ti.members && ti.needsCodegen() && instancePinned(ti) == thisWorker())
                 toObjFile(ti, multiobj);
         }
     }
