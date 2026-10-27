@@ -33,8 +33,10 @@ the parts (`ld -r`, or the library writer) placed them:
 With --stress K, each -j=N is also compiled K more times in the determinism stress
 mode of the compiler (DMD_SPLIT_STRESS set to K different seeds, from --stress-seed
 on), in which every process of the split sleeps for pseudo-random short times at the
-points where they synchronize, so that they run at other relative speeds: each of
-those outputs must be byte for byte the -j=N output compiled without it.
+points where they synchronize, so that they run at other relative speeds, and the
+memory the backend's arrays grow into is filled with a byte that changes with the
+seed (DMD_BARRAY_FILL), so that code reading what it has not written shows: each of
+those outputs must be byte for byte the -j=N output compiled without either.
 
 Usage:
   splitcheck.py [-j 2,3,8] [-r 3] [--stress K [--stress-seed S]] [--dmd DMD] [--cwd DIR]
@@ -638,8 +640,10 @@ def compile_once(cmd, kind, jobs, outdir, cwd, logfile, stress=0):
     env["DMD_SPLIT_LOG"] = logfile
     if stress:
         env["DMD_SPLIT_STRESS"] = str(stress)
+        env["DMD_BARRAY_FILL"] = str(stress * 37 % 256)
     else:
         env.pop("DMD_SPLIT_STRESS", None)
+        env.pop("DMD_BARRAY_FILL", None)
     if os.path.exists(logfile):
         os.remove(logfile)
     p = subprocess.run(args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
