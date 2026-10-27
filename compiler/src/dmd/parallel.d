@@ -383,6 +383,15 @@ Workers split(ref Modules modules, uint n, uint[] assign)
         workerCount = cast(uint)n;
         foreach (j, m; modules)
             moduleOwners[cast(void*)m] = w.assign[j];
+        /* The speculative instances are found before forking, so that the workers do
+         * not each read every member of the root modules, faulting in pages they share
+         */
+        foreach (m; modules)
+            if (m.members)
+                foreach (s; *m.members)
+                    if (auto ti = s.isTemplateInstance())
+                        if (!ti.minst)
+                            speculative ~= ti;
 
         fflush(stdout);
         fflush(stderr);
@@ -431,11 +440,6 @@ Workers split(ref Modules modules, uint n, uint[] assign)
                     lateSeen ~= m.members.length;
                     membersAtSplit[cast(void*)m] = m.members.length;
                 }
-                if (m.members)
-                    foreach (s; *m.members)
-                        if (auto ti = s.isTemplateInstance())
-                            if (!ti.minst)
-                                speculative ~= ti;
             }
             modules.setDim(k);
             adopting = true;
@@ -445,6 +449,7 @@ Workers split(ref Modules modules, uint n, uint[] assign)
 
         names = null;               // the original process generates all it compiles
         moduleOwners = null;
+        speculative = null;
         clearPlan();
         w.count = cast(int)children.length;
         w.succeeded = children.length == n;
