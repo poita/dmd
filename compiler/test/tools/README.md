@@ -57,6 +57,15 @@ whether each `-j=N` compilation was split, and why a worker gave the split up;
 with `--require-split`, one that was not is an error. Any difference is a compiler
 bug. `fuzz/splitfuzz.py` runs it on random multi-module programs.
 
+With `--stress K` each `-j=N` is compiled K more times in the compiler's
+determinism stress mode, with seeds from `--stress-seed` on: `DMD_SPLIT_STRESS`
+makes every process of the split sleep for pseudo-random short times, a function of
+the seed, the process and the point, wherever the processes synchronize (forking,
+publishing names, meeting to settle who generates what, generating, writing parts,
+reporting, waiting and merging), and `DMD_BARRAY_FILL` fills the memory the
+backend's arrays grow into with a byte from the seed. Each output must be byte for
+byte the one compiled without them.
+
 ---
 
 The following files are deprecated and will be removed in the future.
