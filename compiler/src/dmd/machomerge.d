@@ -213,6 +213,7 @@ struct Part
     Sect[] sects;
     Sym[] syms;
     uint[] outSym;      // the output symbol of each symbol, uint.max if removed
+    uint[] symExt;      // the external symbol of each external symbol, in `Merger.exts`
     bool[] symDropped;  // the external definitions dropped for another
     Dwarf[] dwarf;      // the debug section kind of each section
     int[Dwarf.max + 1] dwarfSect = -1;  // the section of each debug section kind
@@ -510,7 +511,8 @@ struct Merger
     ListMap[] locMaps;
     Unit[] units;
     Abbrev[ulong][] abbrevs;
-    uint[ulong][] abbrevCodes;
+    const(Abbrev)*[][] abbrevTable;     // by code
+    uint[][] codeMap;                   // the merged code of each code
     uint[][] fileMap;
     DieAt[][] dies;
     ulong[] cuRanges;
@@ -681,6 +683,7 @@ struct Merger
             }
         }
         p.outSym.length = p.syms.length;
+        p.symExt.length = p.syms.length;
         p.symDropped.length = p.syms.length;
         foreach (ref s; p.sects)
             s.relocDropped.length = s.relocs.length;
@@ -775,6 +778,7 @@ struct Merger
                     x.name = s.name;
                     exts ~= x;
                 }
+                p.symExt[si] = e;
                 auto x = &exts[e];
                 if (s.kind == N_UNDF)
                 {
@@ -879,7 +883,7 @@ struct Merger
                         if (p.symDropped[k])
                         {
                             dropped = true;
-                            ext = extIndex[p.syms[k].name];
+                            ext = p.symExt[k];
                         }
                         else
                             kept = true;
@@ -980,7 +984,7 @@ struct Merger
                     if (p.symDropped[u.symbolnum])
                     {
                         dropped = true;
-                        ext = extIndex[p.syms[u.symbolnum].name];
+                        ext = p.symExt[u.symbolnum];
                     }
                 }
                 else
@@ -1216,13 +1220,13 @@ struct Merger
         foreach (pi, ref p; parts)
             foreach (k, ref s; p.syms)
                 if (s.isExt && s.kind != N_UNDF && !p.symDropped[k])
-                    exts[extIndex[s.name]].outIndex = n++;
+                    exts[p.symExt[k]].outIndex = n++;
         nextdef = n - nlocal;
         foreach (ref p; parts)
             foreach (k, ref s; p.syms)
                 if (s.isExt && s.kind == N_UNDF)
                 {
-                    auto x = &exts[extIndex[s.name]];
+                    auto x = &exts[p.symExt[k]];
                     if (x.defPart < 0 && x.outIndex == uint.max)
                         x.outIndex = n++;
                 }
@@ -1230,7 +1234,7 @@ struct Merger
         foreach (ref p; parts)
             foreach (k, ref s; p.syms)
                 if (s.isExt)
-                    p.outSym[k] = exts[extIndex[s.name]].outIndex;
+                    p.outSym[k] = exts[p.symExt[k]].outIndex;
         if (n > 0xFF_FFFF)
             fail("too many symbols");
     }
@@ -1441,7 +1445,8 @@ struct Merger
         dwarfBase.length = n;
         locMaps.length = n;
         units.length = n;
-        abbrevCodes.length = n;
+        codeMap.length = n;
+        abbrevTable.length = n;
         abbrevs.length = n;
         fileMap.length = n;
         dies.length = n;
@@ -1533,6 +1538,14 @@ struct Merger
         u.present = true;
         units[pi] = u;
         abbrevs[pi] = parseAbbrevs(p.sects[abbrevSi].data, abbrevOff);
+        foreach (code, ref a; abbrevs[pi])
+        {
+            if (code > 0xFFFF)
+                fail("abbreviation code too large");
+            if (code >= abbrevTable[pi].length)
+                abbrevTable[pi].length = cast(size_t)code + 1;
+            abbrevTable[pi][cast(size_t)code] = &a;
+        }
         if (firstUnit < 0)
             firstUnit = cast(int)pi;
         else if (units[firstUnit].version_ != u.version_)
@@ -1648,7 +1661,9 @@ struct Merger
                     os.data.putUleb(c);
                     os.data.put(b[]);
                 }
-                abbrevCodes[pi][code] = c;
+                if (code >= codeMap[pi].length)
+                    codeMap[pi].length = cast(size_t)code + 1;
+                codeMap[pi][cast(size_t)code] = c;
             }
         }
         os.data.put8(0);
@@ -1826,7 +1841,7 @@ struct Merger
         auto order = sortedRelocs(*sect);
         const fmap = fileMap[pi];
         LineRow state;
-        LineRow[] rows;
+        LineRow[] rows, kept;
         uint seqSect;
         void reset() { state = LineRow(0, 1, 0, 1, h.defaultIsStmt != 0, false); }
         reset();
@@ -1838,10 +1853,12 @@ struct Merger
                 if (rows.length > 1)
                     fail("line sequence without its address");
                 rows.length = 0;
+                rows.assumeSafeAppend();
                 return;
             }
             const t = &p.sects[seqSect - 1];
-            LineRow[] kept;
+            kept.length = 0;
+            kept.assumeSafeAppend();
             foreach (ref row; rows)
             {
                 const o = row.addr - t.addr;
@@ -1855,6 +1872,7 @@ struct Merger
                 kept ~= k;
             }
             rows.length = 0;
+            rows.assumeSafeAppend();
             if (kept.length < 2)
                 return;     // nothing but the end
             os.data.put8(0);
@@ -2156,7 +2174,14 @@ struct Merger
         os.data.put8(8);
         static struct RefPatch { size_t at; ubyte size; size_t part; ulong target; bool sibling; }
         RefPatch[] refs;
+        refs.reserve(1 << 16);
         Attr[] attrs;
+        size_t maxAttrs;
+        foreach (pi; 0 .. parts.length)
+            foreach (ab; abbrevTable[pi])
+                if (ab && ab.attrs.length > maxAttrs)
+                    maxAttrs = ab.attrs.length;
+        Attr[] attrBuf = new Attr[maxAttrs];
         foreach (pi, ref p; parts)
         {
             const u = &units[pi];
@@ -2165,6 +2190,10 @@ struct Merger
             const si = p.dwarfSect[Dwarf.info];
             const info = &p.sects[si];
             auto order = sortedRelocs(*info);
+            dies[pi].reserve(info.data.length / 8);
+            const table = abbrevTable[pi];
+            const codes = codeMap[pi];
+            size_t rc;      // the relocations before are of the DIEs copied
             Reader r = Reader(info.data[0 .. u.end], u.dies);
             int depth;
             int skipDepth = -1;     // the depth of the DIE whose subtree is skipped
@@ -2187,13 +2216,13 @@ struct Merger
                         os.data.put8(0);
                     continue;
                 }
-                const ab = code in abbrevs[pi];
+                const ab = code < table.length ? table[cast(size_t)code] : null;
                 if (!ab)
                     fail("unknown abbreviation");
-                attrs.length = 0;
-                foreach (ref af; ab.attrs)
+                attrs = attrBuf[0 .. ab.attrs.length];
+                foreach (ai, ref af; ab.attrs)
                 {
-                    Attr a;
+                    auto a = &attrs[ai];
                     a.at = af[0];
                     a.start = r.pos;
                     uint form = af[1];
@@ -2203,7 +2232,6 @@ struct Merger
                     a.value = r.pos;
                     skipForm(r, form, u.version_);
                     a.end = r.pos;
-                    attrs ~= a;
                 }
                 const isUnit = depth == 0;
                 if (ab.children)
@@ -2217,10 +2245,11 @@ struct Merger
                     continue;
                 }
                 dies[pi] ~= DieAt(dieStart, os.data.length);
-                os.data.putUleb(abbrevCodes[pi][code]);
+                os.data.putUleb(codes[cast(size_t)code]);
                 foreach (ref a; attrs)
                 {
-                    os.data.put(info.data[a.start .. a.value]);     // the forms of indirect ones
+                    if (a.start != a.value)
+                        os.data.put(info.data[a.start .. a.value]);     // the forms of indirect ones
                     const at = os.data.length;
                     ulong v;
                     ubyte size;
@@ -2294,7 +2323,9 @@ struct Merger
                     }
                     os.data.put(info.data[a.value .. a.end]);
                     // the relocations of the value, of an address or in an expression
-                    for (size_t i = findFirstReloc(*info, order, a.value); i < order.length; ++i)
+                    while (rc < order.length && info.relocs[order[rc]].address < a.value)
+                        ++rc;
+                    for (size_t i = rc; i < order.length; ++i)
                     {
                         const rel = info.relocs[order[i]];
                         if (rel.address >= a.end)
@@ -2516,17 +2547,13 @@ struct Merger
         // the symbol and string tables
         Buffer strtab;
         strtab.put8(0);
-        uint[const(char)[]] strings;
         uint str(const(char)[] s)
         {
             if (!s.length)
                 return 0;
-            if (auto p = s in strings)
-                return *p;
             const o = cast(uint)strtab.length;
             strtab.put(cast(const(ubyte)[])s);
             strtab.put8(0);
-            strings[s] = o;
             return o;
         }
         Buffer symtab;
@@ -2563,7 +2590,7 @@ struct Merger
                 {
                     if (!s.isExt || s.kind != N_UNDF)
                         continue;
-                    const e = extIndex[s.name];
+                    const e = p.symExt[k];
                     auto x = &exts[e];
                     if (x.defPart >= 0 || done[e])
                         continue;
