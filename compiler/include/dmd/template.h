@@ -264,6 +264,7 @@ private:
     unsigned short _nest;                // for recursive pretty printing detection, 3 MSBs reserved for flags
 public:
     unsigned char inuse;                 // for recursive expansion detection
+    d_bool hasAlwaysInlines;             // a function in it contains references to functions that must be inlined
 
     TemplateInstance *syntaxCopy(Dsymbol *) override;
     const char *kind() const override;

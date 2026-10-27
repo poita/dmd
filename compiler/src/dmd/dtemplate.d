@@ -808,6 +808,7 @@ extern (C++) class TemplateInstance : ScopeDsymbol
 
     private ushort _nest;       // for recursive pretty printing detection, 3 MSBs reserved for flags (below)
     ubyte inuse;                // for recursive expansion detection
+    bool hasAlwaysInlines;      // a function in it contains references to functions that must be inlined
 
     private enum Flag : uint
     {
