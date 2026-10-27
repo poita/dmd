@@ -12709,7 +12709,9 @@ private bool vectorizeLoops()
     lv.ndefs[][] = 0;
     lv.defIns.setLength(nregs);
     lv.inLoop.setLength(nregs);
+    lv.inLoop[][] = false;
     lv.seen.setLength(nregs);
+    lv.seen[][] = false;
     foreach (n, ref i; ins[])
         if (i.d && !isPhys(i.d))
         {
