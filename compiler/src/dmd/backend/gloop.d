@@ -4044,12 +4044,19 @@ private bool unrollBranches(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     for (size_t i = 0; (i = vec_index(i, l.Lloop)) < bo.dfo.length; ++i)
     {
         block* b = bo.dfo[i];
-        if (nblocks == maxBlocks || b.Btry || (b.bc != BC.goto_ && b.bc != BC.iftrue) ||
-            (b != tail && vec_testbit(b.Bdfoidx, l.Lexit)))
+        if (nblocks == maxBlocks || b.Btry || (b.bc != BC.goto_ && b.bc != BC.iftrue))
             return false;
         blocks[nblocks++] = b;
     }
     bool inLoop(block* b) { return vec_testbit(b.Bdfoidx, l.Lloop) != 0; }
+    /* only the tail leaves the loop, but for a block that never returns, such as
+     * the failure of a bounds check, which each copy goes to as the loop does
+     */
+    foreach (b; blocks[0 .. nblocks])
+        if (b != tail && vec_testbit(b.Bdfoidx, l.Lexit))
+            foreach (s; b.Bsucc[])
+                if (!inLoop(s) && s.bc != BC.exit)
+                    return false;
     size_t indexOf(block* b)
     {
         foreach (i; 0 .. nblocks)

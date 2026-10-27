@@ -399,7 +399,8 @@ bool lirCodegen(ref CGstate cg)
         // the vectors made may be of values the same throughout a loop
         const loopsDone = !env!"DMD_NEWCG_NOLOOPVEC" && vectorizeLoops();
         const pairsDone = !env!"DMD_NEWCG_NOSLP" && vectorize();
-        if ((loopsDone || pairsDone) && !env!"DMD_NEWCG_NOLICM")
+        const chainsDone = !env!"DMD_NEWCG_NOSLPRED" && vectorizeReductionChains();
+        if ((loopsDone || pairsDone || chainsDone) && !env!"DMD_NEWCG_NOLICM")
             hoistInvariants();
         if (!env!"DMD_NEWCG_NOTHREAD")
             threadJumps();
@@ -8974,8 +8975,6 @@ private bool ifConvertBranches()
             mem_free(lp.body.ptr);
         loops.dtor(); preds.dtor(); predStart.dtor(); ndefs.dtor(); nuses.dtor(); inLoop.dtor(); inserts.dtor();
     }
-    if (!loops.length)
-        return false;
     inLoop.setLength(ns);
     inLoop[][] = false;
     foreach (ref lp; loops[])
@@ -9113,8 +9112,6 @@ private bool ifConvertBranches()
     bool again;     // an if left for a round after this one, as a segment of it is changed here
     foreach (uint s; 0 .. cast(uint)ns - 2)
     {
-        if (!inLoop[s])
-            continue;
         const send = segEnd(s);
         if (send <= segStart[s])
             continue;
@@ -9214,6 +9211,19 @@ private bool ifConvertBranches()
         }
         if (!ok || count == 0 || count > 8)
             continue;
+        // out of loops only a choice between values made already, which a select is cheaper than
+        if (!inLoop[s])
+        {
+            foreach (k; 0 .. 2)
+            {
+                const Way w = k ? wt : wf;
+                foreach (n; segStart[w.a] .. (w.b > w.a ? segEnd(w.b - 1) : segStart[w.a]))
+                    if (ins[n].op != LOp.nop && ins[n].op != LOp.label && ins[n].op != LOp.copy && ins[n].op != LOp.br)
+                        ok = false;
+            }
+            if (!ok)
+                continue;
+        }
         // what the copies set, as each way leaves it
         foreach (k; 0 .. 2)
         {
@@ -14234,6 +14244,777 @@ private void vectorizeRegion(ref Slp s, uint rs, uint re)
  * of it, then CBZ/CBNZ, is a branch on the flags themselves, when nothing in
  * between changes them. The CSET and what follows it are then left to removeDead()
  */
+/******************************* Reduction chains ******************************/
+
+/* The NEON instruction across the lanes of a vector, of lanes of 1 << size bytes,
+ * a whole 16 byte register if q: opc 0x0A max, 0x1A min, 0x1B add, 0x03 add long
+ */
+private uint acrossLanes(uint opc, bool unsigned, uint size, bool q)
+{
+    return 0x0E300800 | q << 30 | unsigned << 29 | size << 22 | opc << 12;
+}
+
+/* The NEON instruction on the lanes of two vectors, of lanes of 1 << size bytes:
+ * opc 0x64 max, 0x6C min, 0x84 add
+ */
+private uint laneByLane(uint opc, bool unsigned, uint size)
+{
+    return 0x4E200000 | unsigned << 29 | size << 22 | opc << 8;
+}
+
+/* Chains of additions, bitwise operations, minimums or maximums in straight line code,
+ * each of the one before and of one more value, of 4 or more values loaded one after
+ * the other from memory: the values loaded as vectors and combined across their lanes,
+ * which is the same in any order as the operations are of integers, wrapping around.
+ * The chain then is of its first value, if not loaded, and of the vectors' result.
+ * Returns whether a chain was made so.
+ */
+@trusted
+private bool vectorizeReductionChains()
+{
+    // cheaply nothing to do: fewer than 4 loads of 1, 2 or 4 bytes without an index
+    {
+        uint nld;
+        foreach (ref i; ins[])
+            if (i.op == LOp.ld && !i.b && !i.sym && i.sz <= 4 && i.a && !(i.flags & F.volatile_))
+                ++nld;
+        if (nld < 4)
+            return false;
+    }
+    buildSegments();
+    const ns = segStart.length - 1;
+    Barray!uint only;
+    scope (exit) only.dtor();
+    soleFallthrough(only);
+
+    const nregs = cast(uint)vinfo.length;
+    // the values of the region looked at: each made by an instruction, or held by a register before it
+    Barray!int cur;             // by register: the value it holds now, or -1
+    Barray!Reg touched;
+    Barray!int defVal;          // by instruction - rs: the value it defines, or -1
+    Barray!int opVal;           // by instruction - rs and operand a, b, c: its value
+    Barray!int valIns;          // by value: the instruction making it, or -1
+    Barray!uint uses;           // by value: the instructions reading it, but copies
+    Barray!bool atEnd;          // by value: held by a register at the end of the region
+    Barray!int flagsOf;         // by instruction - rs: the instruction setting the flags a reader reads
+    Barray!uint readers;        // by instruction - rs: of the flags it sets
+    Barray!Insert inserts;
+    scope (exit)
+    {
+        cur.dtor(); touched.dtor(); defVal.dtor(); opVal.dtor(); valIns.dtor(); uses.dtor(); atEnd.dtor();
+        flagsOf.dtor(); readers.dtor(); inserts.dtor();
+    }
+    cur.setLength(nregs);
+    cur[][] = -1;
+    Barray!uint allReads, endReads;     // by register: its reads, and those in the region of its value at the end
+    scope (exit) { allReads.dtor(); endReads.dtor(); }
+    allReads.setLength(nregs);
+    allReads[][] = 0;
+    endReads.setLength(nregs);
+    endReads[][] = 0;
+    foreach (ref i; ins[])
+    {
+        void count(Reg r) { if (!isPhys(r) && r - firstVreg < nregs) ++allReads[r - firstVreg]; }
+        if (i.op == LOp.ldp)
+        {
+            if (i.a) count(i.a);
+            if (i.b) count(i.b);
+        }
+        else
+            forUses(i, &count);
+    }
+
+    // a step of a chain: d = op(x, y), with the comparison c of a minimum or maximum
+    enum K : ubyte { add, and_, orr, eor, smin, smax, umin, umax }
+    static struct Step { K k; uint at; int cmpAt = -1; int x, y, r; int next = -1, prev = -1; }
+    Barray!Step steps;
+    Barray!int stepOf;          // by value: the step making it, or -1
+    Barray!bool gone;           // by value: no longer made
+    Barray!uint leaves;
+    Barray!bool leafOf;         // by value: loaded for a chain made of vectors
+    Barray!int lds;             // the loads of a chain
+    Barray!bool carrier;        // by instruction - rs: it defines a value made before
+    static struct Ext { LOp op; ubyte sz; long imm; int a, v; }
+    Barray!Ext exts;            // the extensions made in the region
+    scope (exit) { carrier.dtor(); exts.dtor(); }
+    scope (exit) { steps.dtor(); stepOf.dtor(); gone.dtor(); leaves.dtor(); leafOf.dtor(); lds.dtor(); }
+
+    static bool setsFlags(LOp op)
+    {
+        return op == LOp.cmp || op == LOp.cmpi || op == LOp.tsti || op == LOp.fcmp || op == LOp.fcmpz ||
+            op == LOp.call || op == LOp.ccmp || op == LOp.ccmpi || op == LOp.tlv || op == LOp.atomic;
+    }
+    // the same but for the signedness of a minimum or maximum, the same for values not negative
+    static bool sameKind(K a, K b)
+    {
+        return a == b || (a == K.smin || a == K.umin) && (b == K.smin || b == K.umin) ||
+               (a == K.smax || a == K.umax) && (b == K.smax || b == K.umax);
+    }
+    static bool readsFlags(LOp op)
+    {
+        return op == LOp.csel || op == LOp.cset || op == LOp.fcsel || op == LOp.bcond || op == LOp.ccmp ||
+            op == LOp.ccmpi;
+    }
+
+    bool any;
+    void doRegion(uint rs, uint re)
+    {
+        const len = re - rs;
+        foreach (r; touched[])
+            cur[r - firstVreg] = -1;
+        touched.setLength(0);
+        valIns.setLength(0);
+        defVal.setLength(len);
+        defVal[][] = -1;
+        opVal.setLength(len * 3);
+        opVal[][] = -1;
+        flagsOf.setLength(len);
+        flagsOf[][] = -1;
+        readers.setLength(len);
+        readers[][] = 0;
+        carrier.setLength(len);
+        carrier[][] = false;
+        exts.setLength(0);
+        int valueOf(Reg r)
+        {
+            if (!r || isPhys(r) || r - firstVreg >= nregs)
+                return -1;
+            int v = cur[r - firstVreg];
+            if (v < 0)
+            {
+                valIns.push(-1);
+                v = cast(int)valIns.length - 1;
+                cur[r - firstVreg] = v;
+                touched.push(r);
+            }
+            return v;
+        }
+        int lastFlags = -1;
+        uint nsteps;
+        foreach (n; rs .. re)
+        {
+            LIns* i = &ins[n];
+            if (i.op == LOp.nop || i.op == LOp.label)
+                continue;
+            const k = n - rs;
+            opVal[k * 3] = valueOf(i.a);
+            opVal[k * 3 + 1] = valueOf(i.b);
+            if (i.op == LOp.ldp)
+            {
+                // c is the second register it defines
+                if (i.c && !isPhys(i.c) && i.c - firstVreg < nregs)
+                {
+                    cur[i.c - firstVreg] = -1;
+                    touched.push(i.c);
+                }
+            }
+            else
+                opVal[k * 3 + 2] = valueOf(i.c);
+            if (i.op == LOp.csel && i.sz == 4 && lastFlags >= 0 && !(i.flags & F.condDef) && !i.imm)
+            {
+                /* x == 0 ? 0 : x, of an x with no bits but those tested, is x: as max(x, 0)
+                 * of an unsigned x becomes
+                 */
+                const LIns* f = &ins[lastFlags];
+                const x = opVal[(lastFlags - rs) * 3];
+                bool fits = x >= 0 && valIns[x] >= 0 && f.sz == 4;
+                if (fits)
+                {
+                    const LIns* l = &ins[valIns[x]];
+                    const ulong m = l.op == LOp.ld && !(l.flags & F.signed) && l.sz < 4 ? (1UL << (l.sz * 8)) - 1 : 0xFFFF_FFFF;
+                    fits = f.op == LOp.tsti && (f.imm & m) == m || f.op == LOp.cmpi && f.imm == 0;
+                }
+                bool zero(int v) { return v >= 0 && valIns[v] >= 0 && ins[valIns[v]].op == LOp.movi && cast(uint)ins[valIns[v]].imm == 0; }
+                const t = opVal[k * 3], e = opVal[k * 3 + 1];
+                Reg r;
+                if (fits && i.cond == COND.eq && zero(t) && e == x)
+                    r = i.b;
+                else if (fits && i.cond == COND.ne && t == x && zero(e))
+                    r = i.a;
+                if (r)
+                {
+                    i.op = LOp.copy;
+                    i.a = r;
+                    i.b = noReg;
+                    i.cond = 0;
+                    opVal[k * 3] = x;
+                    opVal[k * 3 + 1] = -1;
+                }
+            }
+            if (readsFlags(i.op))
+            {
+                flagsOf[k] = lastFlags;
+                if (lastFlags >= 0)
+                    ++readers[lastFlags - rs];
+            }
+            if (setsFlags(i.op))
+                lastFlags = cast(int)n;
+            if (i.op == LOp.call)
+            {
+                // the registers it destroys hold what is not known here
+                lastFlags = -1;
+            }
+            if (i.d && !isPhys(i.d) && i.d - firstVreg < nregs)
+            {
+                int v = -1;
+                if (i.op == LOp.copy && i.a && !isPhys(i.a) && rcOf(i.a) == rcOf(i.d) && rcOf(i.d) == RC.gp &&
+                    i.sz >= 4 && !(i.flags & F.condDef))
+                {
+                    v = opVal[k * 3];       // the same value, as far as 32 bit operations read it
+                    carrier[k] = v >= 0;
+                }
+                else if ((i.op == LOp.sext || i.op == LOp.zext) && opVal[k * 3] >= 0 && !(i.flags & F.condDef))
+                {
+                    // the same extension of the same value as one before
+                    foreach_reverse (ref e; exts[])
+                        if (e.op == i.op && e.sz == i.sz && e.imm == i.imm && e.a == opVal[k * 3])
+                        {
+                            v = e.v;
+                            carrier[k] = true;
+                            break;
+                        }
+                }
+                if (v < 0 && !carrier[k])
+                {
+                    valIns.push(cast(int)n);
+                    v = cast(int)valIns.length - 1;
+                    if (i.op == LOp.sext || i.op == LOp.zext)
+                        exts.push(Ext(i.op, i.sz, i.imm, opVal[k * 3], v));
+                    nsteps += i.op == LOp.csel || i.op == LOp.add || i.op == LOp.and_ || i.op == LOp.orr ||
+                              i.op == LOp.eor;
+                }
+                if (i.flags & F.condDef)
+                    v = -1;
+                if (cur[i.d - firstVreg] < 0 && v >= 0)
+                    touched.push(i.d);
+                cur[i.d - firstVreg] = v;
+                if (v < 0)
+                    touched.push(i.d);
+                defVal[k] = v;
+            }
+        }
+        if (nsteps < 3)
+            return;
+        const nv = cast(uint)valIns.length;
+        uses.setLength(nv);
+        uses[][] = 0;
+        atEnd.setLength(nv);
+        atEnd[][] = false;
+        // a value a register holds at the end, read after the region or before it again
+        foreach (n; rs .. re)
+        {
+            const LIns* i = &ins[n];
+            const k = n - rs;
+            const Reg[3] rr = [i.a, i.b, i.op == LOp.ldp ? noReg : i.c];
+            foreach (j; 0 .. 3)
+                if (rr[j] && !isPhys(rr[j]) && opVal[k * 3 + j] >= 0 && opVal[k * 3 + j] == cur[rr[j] - firstVreg])
+                    ++endReads[rr[j] - firstVreg];
+        }
+        foreach (r; touched[])
+        {
+            if (cur[r - firstVreg] >= 0 && endReads[r - firstVreg] != allReads[r - firstVreg])
+                atEnd[cur[r - firstVreg]] = true;
+            endReads[r - firstVreg] = 0;
+        }
+        foreach (n; rs .. re)
+        {
+            const LIns* i = &ins[n];
+            const k = n - rs;
+            if (i.op == LOp.nop || i.op == LOp.label || carrier[k])
+                continue;
+            foreach (j; 0 .. 3)
+                if (opVal[k * 3 + j] >= 0)
+                    ++uses[opVal[k * 3 + j]];
+        }
+
+        // the steps
+        steps.setLength(0);
+        stepOf.setLength(nv);
+        stepOf[][] = -1;
+        foreach (n; rs .. re)
+        {
+            const LIns* i = &ins[n];
+            const k = n - rs;
+            if (i.sz != 4 || defVal[k] < 0 || valIns[defVal[k]] != n || i.flags & (F.condDef | F.shifted))
+                continue;
+            Step st;
+            st.at = cast(uint)n;
+            st.r = defVal[k];
+            switch (i.op)
+            {
+                case LOp.add: st.k = K.add; break;
+                case LOp.and_: st.k = K.and_; break;
+                case LOp.orr: st.k = K.orr; break;
+                case LOp.eor: st.k = K.eor; break;
+                case LOp.csel:
+                {
+                    // of a comparison of its operands, read by it only
+                    const f = flagsOf[k];
+                    if (f < 0 || readers[f - rs] != 1 || i.imm)
+                        continue;
+                    const LIns* c = &ins[f];
+                    if (c.sz != 4 || c.op != LOp.cmp && c.op != LOp.cmpi)
+                        continue;
+                    const ca = opVal[(f - rs) * 3];
+                    int cb = opVal[(f - rs) * 3 + 1];
+                    const t = opVal[k * 3], e = opVal[k * 3 + 1];
+                    if (c.op == LOp.cmpi)
+                    {
+                        // the other operand the constant compared with
+                        const o = t == ca ? e : t;
+                        if (o < 0 || valIns[o] < 0 || ins[valIns[o]].op != LOp.movi ||
+                            cast(uint)ins[valIns[o]].imm != cast(uint)c.imm)
+                            continue;
+                        cb = o;
+                    }
+                    if (ca < 0 || cb < 0 || ca == cb || !(t == ca && e == cb || t == cb && e == ca))
+                        continue;
+                    // t when ca cond cb, else e
+                    bool less, signed;
+                    switch (i.cond)
+                    {
+                        case COND.lt, COND.le: less = true; signed = true; break;
+                        case COND.gt, COND.ge: less = false; signed = true; break;
+                        case COND.cc, COND.ls: less = true; signed = false; break;
+                        case COND.hi, COND.cs: less = false; signed = false; break;
+                        default: continue;
+                    }
+                    // the lesser of the two when it picks ca if ca < cb
+                    const min = less == (t == ca);
+                    st.k = signed ? (min ? K.smin : K.smax) : (min ? K.umin : K.umax);
+                    st.cmpAt = f;
+                    st.x = t;
+                    st.y = e;
+                    break;
+                }
+                default:
+                    continue;
+            }
+            if (i.op != LOp.csel)
+            {
+                st.x = opVal[k * 3];
+                st.y = opVal[k * 3 + 1];
+                if (st.x < 0 || st.y < 0)
+                    continue;
+            }
+            stepOf[st.r] = cast(int)steps.length;
+            steps.push(st);
+        }
+        if (steps.length < 3)
+            return;
+        // each step of the result of one before, its only use, and of no use after the region
+        foreach (sn, ref st; steps[])
+            foreach (o; 0 .. 2)
+            {
+                const v = o ? st.y : st.x;
+                const p = stepOf[v];
+                if (p < 0 || !sameKind(steps[p].k, st.k) || steps[p].next >= 0 || atEnd[v] ||
+                    uses[v] != (st.cmpAt >= 0 ? 2 : 1) || st.prev >= 0)
+                    continue;
+                steps[p].next = cast(int)sn;
+                st.prev = p;
+            }
+
+        gone.setLength(nv);
+        gone[][] = false;
+        leafOf.setLength(nv);
+        leafOf[][] = false;
+        // instruction n made a nop, its operands read once less
+        void drop(uint n)
+        {
+            foreach (j; 0 .. 3)
+                if (opVal[(n - rs) * 3 + j] >= 0)
+                    --uses[opVal[(n - rs) * 3 + j]];
+            ins[n].op = LOp.nop;
+        }
+        foreach (sn, ref head; steps[])
+        {
+            if (head.prev >= 0 || head.next < 0)
+                continue;
+            // the values combined: the head's two, and the other one of each step after
+            leaves.setLength(0);
+            leaves.push(head.x);
+            leaves.push(head.y);
+            int last = cast(int)sn;
+            uint count = 1;
+            for (int q = head.next; q >= 0; q = steps[q].next)
+            {
+                leaves.push(stepOf[steps[q].x] == steps[q].prev ? steps[q].y : steps[q].x);
+                last = q;
+                ++count;
+            }
+            /* the loads, of size sz from one base at consecutive offsets, each maybe
+             * extended from its size to 32 bits, and at most one other value: maybe an
+             * operation of the chain's kind of a load and a constant, the constant then
+             */
+            int init = -1, initOp = -1;
+            int base = -1;
+            ubyte sz;
+            bool sgn;
+            long lo = long.max, hi = long.min;
+            uint nload, firstAt = uint.max, lastAt;
+            bool ok = true;
+            lds.setLength(0);
+            // the load v is, extended or not, and whether signed
+            int loadOf(int v, out bool signed)
+            {
+                int at = valIns[v];
+                if (at < 0)
+                    return -1;
+                const LIns* e = &ins[at];
+                if ((e.op == LOp.sext || e.op == LOp.zext) && e.sz == 4 && (e.imm == 8 || e.imm == 16))
+                {
+                    const u = opVal[(at - rs) * 3];
+                    if (u < 0 || valIns[u] < 0 || ins[valIns[u]].op != LOp.ld || ins[valIns[u]].sz * 8 != e.imm)
+                        return -1;
+                    signed = e.op == LOp.sext;
+                    v = u;
+                    at = valIns[u];
+                }
+                else
+                    signed = (e.flags & F.signed) && e.sz < 4;
+                const LIns* l = &ins[at];
+                if (l.op != LOp.ld || l.b || l.sym || l.sz > 4 || l.flags & (F.volatile_ | F.condDef) ||
+                    opVal[(at - rs) * 3] < 0)
+                    return -1;
+                return v;
+            }
+            bool addLoad(int v)
+            {
+                bool signed;
+                const u = loadOf(v, signed);
+                if (u < 0)
+                    return false;
+                const LIns* l = &ins[valIns[u]];
+                const b = opVal[(valIns[u] - rs) * 3];
+                if (nload && (b != base || l.sz != sz || signed != sgn))
+                    return false;
+                base = b;
+                sz = l.sz;
+                sgn = signed;
+                ++nload;
+                lo = l.imm < lo ? l.imm : lo;
+                hi = l.imm > hi ? l.imm : hi;
+                firstAt = valIns[u] < firstAt ? valIns[u] : firstAt;
+                lastAt = valIns[u] > lastAt ? valIns[u] : lastAt;
+                lds.push(u);
+                return true;
+            }
+            foreach (v; leaves[])
+            {
+                if (addLoad(v))
+                    continue;
+                if (init >= 0)
+                    ok = false;
+                init = v;
+            }
+            if (ok && init >= 0 && valIns[init] >= 0 && uses[init] == (head.cmpAt >= 0 ? 2 : 1) && !atEnd[init])
+            {
+                // the first value an operation of the kind of a load and a constant
+                const LIns* x = &ins[valIns[init]];
+                const LOp want = head.k == K.add ? LOp.addi : head.k == K.and_ ? LOp.andi :
+                                 head.k == K.orr ? LOp.orri : head.k == K.eor ? LOp.eori : LOp.nop;
+                if (x.op == want && x.sz == 4 && addLoad(opVal[(valIns[init] - rs) * 3]))
+                {
+                    leaves.push(opVal[(valIns[init] - rs) * 3]);
+                    initOp = valIns[init];
+                }
+            }
+            const bytes = nload * sz;
+            if (!ok || nload < 4 || hi - lo != (nload - 1) * sz || bytes != 8 && bytes != 16 && bytes != 32 && bytes != 64)
+                continue;
+            {
+                // each offset once
+                ulong seen;
+                foreach (u; lds[])
+                {
+                    const off = (ins[valIns[u]].imm - lo) / sz;
+                    if ((ins[valIns[u]].imm - lo) % sz || seen & (1UL << off))
+                        ok = false;
+                    seen |= 1UL << off;
+                }
+                if (!ok)
+                    continue;
+            }
+            const K kind = head.k;
+            {
+                // signed and unsigned the same for values not negative: zero extended, and a constant
+                bool mixed;
+                for (int q = cast(int)sn; q >= 0; q = steps[q].next)
+                    mixed |= steps[q].k != kind;
+                if (mixed && (sgn || sz == 4 || initOp >= 0 || init >= 0 && (valIns[init] < 0 ||
+                    ins[valIns[init]].op != LOp.movi || cast(uint)ins[valIns[init]].imm >= 0x8000_0000)))
+                    continue;
+            }
+            const signedLoad = sgn;
+            const size = sz == 1 ? 0 : sz == 2 ? 1 : 2;
+            const nvec = bytes <= 16 ? 1 : bytes / 16;
+            // added in their lanes with no wrapping around, one vector of narrow ones
+            if (kind == K.add && sz < 4 && nvec > 1)
+                continue;
+            // the memory read at the last load as the loads read it
+            foreach (n; firstAt .. lastAt)
+                if (writesMemory(ins[n]))
+                    ok = false;
+            const Reg baseReg = ins[lastAt].a;
+            if (!ok || ins[lastAt].d == baseReg || isPhys(baseReg))
+                continue;
+            // fewer instructions: those of the steps and the loads only they read, for a few
+            uint saved = count * (head.cmpAt >= 0 ? 2 : 1) + (initOp >= 0);
+            foreach (v; leaves[])
+                if (v != init && uses[v] == 1 + (head.cmpAt >= 0) && !atEnd[v])
+                    saved += 1 + (valIns[v] >= 0 && ins[valIns[v]].op != LOp.ld);
+            uint cost = nvec + (nvec - 1) + (head.cmpAt >= 0 ? 2 : 1) + (sz < 4 && kind != K.add);
+            if (kind <= K.eor && kind != K.add)
+            {
+                cost += 2 + (bytes >= 16) * 2;
+                for (uint w = 32; w >= sz * 8; w /= 2)
+                    cost += 2;
+            }
+            else
+                cost += 2;
+            if (saved <= cost)
+                continue;
+
+            // the vectors, at the last load
+            Barray!LIns code;
+            scope (exit) code.dtor();
+            Reg[4] vec;
+            foreach (q; 0 .. nvec)
+            {
+                vec[q] = newVreg(RC.fp, 16);
+                const vsz = bytes < 16 ? bytes : 16;
+                long off = lo + q * 16;
+                Reg at = baseReg;
+                if (!(off >= 0 && off % vsz == 0 && off / vsz < 4096 || off >= -256 && off < 256))
+                {
+                    at = newVreg(RC.gp, 8);
+                    LoopVec.addImm(code, 8, at, baseReg, off);
+                    off = 0;
+                }
+                LIns l;
+                l.op = LOp.vld;
+                l.sz = cast(ubyte)vsz;
+                l.d = vec[q];
+                l.a = at;
+                l.imm = off;
+                code.push(l);
+            }
+            const q16 = bytes >= 16;
+            const bool uns = kind == K.umin || kind == K.umax || !signedLoad && (kind == K.smin || kind == K.smax);
+            Reg acc = vec[0];
+            foreach (q; 1 .. nvec)
+            {
+                Reg d = newVreg(RC.fp, 16);
+                uint templ;
+                final switch (kind)
+                {
+                    case K.add: templ = laneByLane(0x84, false, size); break;
+                    case K.and_: templ = Neon.and16b; break;
+                    case K.orr: templ = Neon.orr16b; break;
+                    case K.eor: templ = Neon.eor16b; break;
+                    case K.smin, K.umin: templ = laneByLane(0x6C, uns, size); break;
+                    case K.smax, K.umax: templ = laneByLane(0x64, uns, size); break;
+                }
+                LoopVec.emitTo(code, LOp.vq, 16, d, acc, vec[q], templ);
+                acc = d;
+            }
+            // across the lanes, to a general register, extended as the loads are to 32 bits
+            Reg res = newVreg(RC.gp, 4);
+            uint resBits = sz * 8;
+            if (kind <= K.eor && kind != K.add)
+            {
+                Reg x = newVreg(RC.gp, 8);
+                const LOp op = kind == K.and_ ? LOp.and_ : kind == K.orr ? LOp.orr : LOp.eor;
+                LoopVec.emitTo(code, LOp.vgq, 8, x, acc, noReg, Neon.fmovXD);
+                if (q16)
+                {
+                    Reg y = newVreg(RC.gp, 8), z = newVreg(RC.gp, 8);
+                    LoopVec.emitTo(code, LOp.vgq, 8, y, acc, noReg, Neon.umovXD1);
+                    LoopVec.emitTo(code, op, 8, z, x, y);
+                    x = z;
+                }
+                for (uint w = 32; w >= sz * 8; w /= 2)
+                {
+                    Reg t = newVreg(RC.gp, 8), u = newVreg(RC.gp, 8);
+                    LoopVec.emitTo(code, LOp.lsri, 8, t, x, noReg, w);
+                    LoopVec.emitTo(code, op, 8, u, x, t);
+                    x = u;
+                }
+                LoopVec.emitTo(code, LOp.copy, 4, res, x);
+            }
+            else
+            {
+                uint templ;
+                if (kind == K.add)
+                {
+                    if (sz < 4)
+                    {
+                        templ = acrossLanes(0x03, !signedLoad, size, q16);
+                        resBits = sz * 16;
+                    }
+                    else
+                        templ = acrossLanes(0x1B, false, size, q16);
+                }
+                else
+                    templ = acrossLanes(kind == K.smin || kind == K.umin ? 0x1A : 0x0A, uns, size, q16);
+                Reg r = newVreg(RC.fp, 16);
+                LoopVec.emitTo(code, LOp.vq, 16, r, acc, noReg, templ);
+                LoopVec.emitTo(code, LOp.vgq, 4, res, r, noReg, Neon.fmovWS);
+            }
+            if (resBits < 32)
+            {
+                Reg e = newVreg(RC.gp, 4);
+                LoopVec.emitTo(code, signedLoad ? LOp.sext : LOp.zext, 4, e, res, noReg, resBits);
+                res = e;
+            }
+            foreach (ref i; code[])
+                inserts.push(Insert(lastAt + 1, i, false));
+
+            // the last step of the chain is of the first value, if not loaded, and of res
+            Step* fin = &steps[last];
+            LIns* f = &ins[fin.at];
+            Reg initReg;
+            if (initOp >= 0)
+            {
+                initReg = newVreg(RC.gp, 4);
+                LIns m;
+                m.op = LOp.movi;
+                m.sz = 4;
+                m.d = initReg;
+                m.imm = cast(uint)ins[initOp].imm;
+                inserts.push(Insert(lastAt + 1, m, false));
+            }
+            else if (init >= 0)
+            {
+                // the register holding it at the last step
+                foreach (o; 0 .. 3)
+                    if (opVal[(fin.at - rs) * 3 + o] == init)
+                        initReg = o == 0 ? f.a : o == 1 ? f.b : f.c;
+                if (!initReg)
+                {
+                    // held as the head reads it, by a register unchanged up to the last step
+                    const LIns* h = &ins[head.at];
+                    foreach (o; 0 .. 2)
+                        if (opVal[(head.at - rs) * 3 + o] == init)
+                            initReg = o == 0 ? h.a : h.b;
+                    if (!initReg)
+                    {
+                        // undo: the code made for the vectors is not used
+                        inserts.setLength(inserts.length - code.length);
+                        continue;
+                    }
+                    bool changed;
+                    foreach (n; head.at .. fin.at)
+                        changed |= ins[n].d == initReg;
+                    if (changed)
+                    {
+                        // kept from where the head reads it
+                        Reg r = newVreg(RC.gp, 8);
+                        LIns c;
+                        c.op = LOp.copy;
+                        c.sz = 8;
+                        c.d = r;
+                        c.a = initReg;
+                        inserts.push(Insert(head.at, c, false));
+                        initReg = r;
+                    }
+                }
+            }
+            // the steps and the loads only they read go
+            for (int q = cast(int)sn; q >= 0; q = steps[q].next)
+            {
+                if (q == last)
+                    break;
+                gone[steps[q].r] = true;
+                drop(steps[q].at);
+                if (steps[q].cmpAt >= 0)
+                    drop(steps[q].cmpAt);
+            }
+            foreach (v; leaves[])
+                if (v != init)
+                    leafOf[v] = true;
+            foreach (u; lds[])
+                leafOf[u] = true;
+            if (initOp >= 0)
+            {
+                gone[init] = true;
+                drop(initOp);
+            }
+            // what the last step read
+            foreach (j; 0 .. 3)
+                if (opVal[(fin.at - rs) * 3 + j] >= 0)
+                    --uses[opVal[(fin.at - rs) * 3 + j]];
+            if (fin.cmpAt >= 0)
+                foreach (j; 0 .. 3)
+                    if (opVal[(fin.cmpAt - rs) * 3 + j] >= 0)
+                        --uses[opVal[(fin.cmpAt - rs) * 3 + j]];
+            if (!initReg)
+            {
+                f.op = LOp.copy;
+                f.sz = 4;
+                f.a = res;
+                f.b = f.c = noReg;
+                f.cond = 0;
+                if (fin.cmpAt >= 0)
+                    ins[fin.cmpAt].op = LOp.nop;
+            }
+            else if (fin.cmpAt >= 0)
+            {
+                LIns* c = &ins[fin.cmpAt];
+                c.op = LOp.cmp;
+                c.a = initReg;
+                c.b = res;
+                c.imm = 0;
+                f.a = initReg;
+                f.b = res;
+                f.cond = kind == K.smin ? COND.lt : kind == K.smax ? COND.gt : kind == K.umin ? COND.cc : COND.hi;
+            }
+            else
+            {
+                f.a = initReg;
+                f.b = res;
+            }
+            any = true;
+        }
+        // the extensions and loads of the chains read by nothing else
+        foreach (pass; 0 .. 2)
+            foreach (v; 0 .. nv)
+                if (leafOf[v] && !gone[v] && !uses[v] && !atEnd[v] && (ins[valIns[v]].op == LOp.ld) == (pass == 1))
+                {
+                    drop(valIns[v]);
+                    gone[v] = true;
+                }
+        // the copies of what is no longer made
+        foreach (n; rs .. re)
+        {
+            LIns* i = &ins[n];
+            const k = n - rs;
+            if (carrier[k] && defVal[k] >= 0 && gone[defVal[k]])
+                i.op = LOp.nop;
+        }
+    }
+
+    uint si = 0;
+    while (si < ns)
+    {
+        uint sj = si;
+        while (sj + 1 < ns && only[sj + 1] && !(segEnd(sj) > segStart[sj] && isBranch(ins[segEnd(sj) - 1].op)))
+            ++sj;
+        if (segEnd(sj) > segStart[si])
+            doRegion(segStart[si], segEnd(sj));
+        si = sj + 1;
+    }
+    if (any)
+    {
+        applyInserts(inserts);
+        clearNops();
+        if (env!"DMD_NEWCG_LOOPVEC")
+            fprintf(stderr, "newcg-loopvec: vectorized %s\n", funcsym_p.Sident.ptr);
+    }
+    return any;
+}
+
 @trusted
 private void fuseBoolBranches()
 {

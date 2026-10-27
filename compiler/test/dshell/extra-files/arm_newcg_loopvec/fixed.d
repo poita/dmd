@@ -27,7 +27,8 @@ pragma(inline, false) int id(int x) @safe { return x; }
     return s;
 }
 
-@safe int vecArgminFixed(const ref int[8] p, int v)
+// unrolled completely, its 8 iterations a straight line of selects
+@safe int unrolledArgminFixed(const ref int[8] p, int v)
 {
     int best = 0, bestErr = int.max;
     foreach (k; 0 .. 8)
@@ -178,7 +179,7 @@ int main()
         foreach (x; p)
             s = id(s + (v > x ? v - x : x - v));
         check(unrolledAbsSum(p, v) == s);
-        check(vecArgminFixed(p, v) == refArgmin(p[], v, false));
+        check(unrolledArgminFixed(p, v) == refArgmin(p[], v, false));
         int[22] q;
         foreach (ref x; q)
             x = rnd() % (t % 3 == 0 ? 4 : 300) - 20;
