@@ -1354,7 +1354,7 @@ private void aecpgenkill(ref GlobalOptimizer go, ref BlockOpt bo, bool genkill =
         else
             ae = true;
 
-        if (ae && OTae(op) && !(n.Ety & (mTYvolatile | mTYshared)) &&
+        if (ae && (OTae(op) || isReadNoneCall(n)) && !(n.Ety & (mTYvolatile | mTYshared)) &&
             // Disallow struct AEs, because we can't handle CSEs that are structs
             tybasic(n.Ety) != TYstruct &&
             tybasic(n.Ety) != TYarray)

@@ -71,8 +71,25 @@ enum
     NFLnogoal = 2,     // evaluate elem for side effects only
     NFLassign = 8,     // unambiguous assignment elem
     NFLhidden = 0x10,  // OPcall: the last argument is the hidden pointer to where a struct is returned
+    NFLreadnone = 0x20, // OPcall, OPucall: the function reads and writes no memory, cannot throw or fail, and returns
     NFLdelcse = 0x40,  // this is not the generating CSE
     NFLtouns  = 0x80,  // relational operator was changed from signed to unsigned
+}
+
+/******************************************
+ * Whether `e` is a call that common subexpression elimination may treat as an
+ * expression of its operands: a direct call of a function marked NFLreadnone
+ * with a scalar result and at most one argument (an argument list is not
+ * shared between calls).
+ */
+@trusted
+bool isReadNoneCall(const elem* e) pure nothrow
+{
+    if (!(e.Nflags & NFLreadnone) || e.E1.Eoper != OPvar)
+        return false;
+    if (e.Eoper == OPcall)
+        return e.E2.Eoper != OPparam && tybasic(e.Ety) != TYstruct && tybasic(e.Ety) != TYvoid;
+    return e.Eoper == OPucall && tybasic(e.Ety) != TYstruct && tybasic(e.Ety) != TYvoid;
 }
 
 /******************************************
