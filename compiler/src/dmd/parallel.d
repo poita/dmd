@@ -45,6 +45,12 @@
  *      may still be reading it in the same round; they only compare its round with
  *      the current one, which reads the same whether they see the store or not. The
  *      second meeting of the round separates those reads from the next publications.)
+ * $(LI The `owner` of a group pinned to the worker compiling its module (see
+ *      `noteLeftPinned`) is stored while the workers publish, so another worker
+ *      publishing in the same round may or may not see it. No worker puts off a
+ *      function of a pinned group, as every worker finds the same groups pinned, so
+ *      what it reads there only concerns groups settled in earlier rounds, which the
+ *      meetings order before it.)
  * $(LI `abort` is only ever set to give up, and `reason` is read by the original
  *      process once every worker has exited, after `waitpid`.)
  * $(LI A worker's output part, its output on stdout and stderr, and the results it
