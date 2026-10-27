@@ -3345,14 +3345,20 @@ bool needsCodegen(TemplateInstance ti)
     // cleared for further invocations.
     TemplateInstance tnext = ti.tnext;
     TemplateInstance tinst = ti.tinst;
-    ti.tnext = null;
+    /* The fields are only stored when they change: a worker of a split compilation
+     * asks again about instances whose pages it shares with the original process,
+     * and a store, even of the same value, copies the page
+     */
+    if (tnext)
+        ti.tnext = null;
 
     // Don't do codegen if the instance has errors,
     // is a dummy instance (see evaluateConstraint),
     // or is determined to be discardable.
     if (ti.errors || ti.inst is null || ti.inst.isDiscardable())
     {
-        ti.minst = null; // mark as speculative
+        if (ti.minst)
+            ti.minst = null; // mark as speculative
         return false;
     }
 
@@ -3451,7 +3457,8 @@ bool needsCodegen(TemplateInstance ti)
             const needsCodegen = tinst.needsCodegen(); // sets tinst.minst
             if (tinst.minst) // not speculative
             {
-                tithis.minst = tinst.minst; // cache result
+                if (tithis.minst !is tinst.minst)
+                    tithis.minst = tinst.minst; // cache result
                 return needsCodegen ? ThreeState.yes : ThreeState.no;
             }
         }
