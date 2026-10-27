@@ -4326,7 +4326,13 @@ private bool functionParameters(Loc loc, Scope* sc,
         else if (sc._module)
             sc._module.hasAlwaysInlines = true;
         if (sc.func)
+        {
             sc.func.hasAlwaysInlines = true;
+            // the scan for inlines visits the template instances enclosing such functions
+            for (Dsymbol p = sc.func.parent; p; p = p.parent)
+                if (auto ti = p.isTemplateInstance())
+                    ti.hasAlwaysInlines = true;
+        }
     }
 
     const isCtorCall = fd && fd.needThis() && fd.isCtorDeclaration();

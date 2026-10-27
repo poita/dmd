@@ -2569,6 +2569,9 @@ public:
         {
             printf("TemplateInstance.inlineScan('%s')\n", ti.toChars());
         }
+        // in the pragma(inline) pass, only the instances enclosing functions it inlines into
+        if (pass == PASS.inlinePragma && !ti.hasAlwaysInlines)
+            return;
         if (!ti.errors && ti.members)
         {
             foreach (i; 0 .. ti.members.length)
