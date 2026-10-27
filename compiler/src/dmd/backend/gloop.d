@@ -3888,6 +3888,111 @@ private bool loadsTableAt(const(elem)* e, const(Symbol*)[] vars)
 }
 
 /********************************
+ * Whether e depends on nothing but vars and constants, and has no side effects
+ */
+@trusted
+private bool onlyOf(const(elem)* e, const(Symbol*)[] vars)
+{
+    switch (e.Eoper)
+    {
+        case OPconst:
+            return true;
+        case OPvar:
+            foreach (v; vars)
+                if (e.Vsym == v && e.Voffset == 0)
+                    return true;
+            return false;
+        case OPadd, OPmin, OPmul, OPshl, OPand, OPor, OPxor:
+        case OPlt, OPle, OPgt, OPge, OPeqeq, OPne:
+            return tyintegral(e.Ety) && onlyOf(e.E1, vars) && onlyOf(e.E2, vars);
+        case OPs32_64, OPu32_64, OP64_32, OPs16_32, OPu16_32, OP32_16, OPs8_16, OPu8_16, OP16_8:
+            return onlyOf(e.E1, vars);
+        default:
+            return false;
+    }
+}
+
+/********************************
+ * The value of e, of which onlyOf is true, with each of vars being x
+ */
+@trusted
+private targ_llong valueAt(const(elem)* e, targ_llong x)
+{
+    // the value as the type of e has it
+    static targ_llong fit(const(elem)* e, targ_ullong r)
+    {
+        const sz = tysize(e.Ety);
+        if (sz >= 8)
+            return r;
+        const bits = sz * 8;
+        r &= (1UL << bits) - 1;
+        if (!tyuns(e.Ety) && (r >> (bits - 1)) & 1)
+            r |= ~0UL << bits;
+        return r;
+    }
+    switch (e.Eoper)
+    {
+        case OPconst:
+            return fit(e, el_tolong(cast(elem*)e));
+        case OPvar:
+            return fit(e, x);
+        case OPadd: return fit(e, valueAt(e.E1, x) + valueAt(e.E2, x));
+        case OPmin: return fit(e, valueAt(e.E1, x) - valueAt(e.E2, x));
+        case OPmul: return fit(e, valueAt(e.E1, x) * valueAt(e.E2, x));
+        case OPshl: return fit(e, cast(targ_ullong)valueAt(e.E1, x) << (valueAt(e.E2, x) & 63));
+        case OPand: return fit(e, valueAt(e.E1, x) & valueAt(e.E2, x));
+        case OPor:  return fit(e, valueAt(e.E1, x) | valueAt(e.E2, x));
+        case OPxor: return fit(e, valueAt(e.E1, x) ^ valueAt(e.E2, x));
+        case OPlt, OPle, OPgt, OPge, OPeqeq, OPne:
+        {
+            const a = valueAt(e.E1, x), b = valueAt(e.E2, x);
+            const uns = tyuns(e.E1.Ety) || tyuns(e.E2.Ety);
+            bool r;
+            switch (e.Eoper)
+            {
+                case OPlt: r = uns ? cast(targ_ullong)a < cast(targ_ullong)b : a < b; break;
+                case OPle: r = uns ? cast(targ_ullong)a <= cast(targ_ullong)b : a <= b; break;
+                case OPgt: r = uns ? cast(targ_ullong)a > cast(targ_ullong)b : a > b; break;
+                case OPge: r = uns ? cast(targ_ullong)a >= cast(targ_ullong)b : a >= b; break;
+                case OPeqeq: r = a == b; break;
+                default: r = a != b; break;
+            }
+            return r;
+        }
+        default:
+            // the conversions
+            return fit(e, fit(e.E1, valueAt(e.E1, x)));
+    }
+}
+
+/********************************
+ * The number of nodes of e once each of vars is a constant, of the values
+ * from x0 by step before x1: what depends on nothing else folds to a
+ * constant, and a `||` or `&&` whose left operand is decided for each of the
+ * values so that its right operand is not evaluated becomes a constant. So
+ * the bounds checks of an index the copies make constant cost nothing.
+ */
+@trusted
+private int unrolledLength(const(elem)* e, const(Symbol*)[] vars, targ_llong x0, targ_llong x1, targ_llong step)
+{
+    if (onlyOf(e, vars))
+        return 1;
+    if ((e.Eoper == OPoror || e.Eoper == OPandand) && onlyOf(e.E1, vars))
+    {
+        bool decided = true;
+        for (targ_llong x = x0; x < x1 && decided; x += step)
+            decided = (valueAt(e.E1, x) != 0) == (e.Eoper == OPoror);
+        if (decided)
+            return 1;
+    }
+    if (OTbinary(e.Eoper))
+        return 1 + unrolledLength(e.E1, vars, x0, x1, step) + unrolledLength(e.E2, vars, x0, x1, step);
+    if (OTunary(e.Eoper))
+        return 1 + unrolledLength(e.E1, vars, x0, x1, step);
+    return 1;
+}
+
+/********************************
  * Add to vars, up to its capacity, the variables e assigns one of vars to
  */
 @trusted
@@ -4000,7 +4105,7 @@ private bool unrollBranches(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
             addCopies(b.Belem, vars, nvars);
     foreach (b; blocks[0 .. nblocks])
     {
-        cost += b.Belem ? el_length(b.Belem) : 0;
+        cost += b.Belem ? unrolledLength(b.Belem, vars[0 .. nvars], initial, final_, increment) : 0;
         if (b.Belem && loadsTableAt(b.Belem, vars[0 .. nvars]))
             tables = true;
     }
