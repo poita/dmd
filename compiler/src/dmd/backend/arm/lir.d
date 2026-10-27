@@ -13329,7 +13329,7 @@ private bool vectorizeLoops()
                         code.push(cc);
                         branch(code, COND.cc, scalarLabel, scalarToLabel);
                     }
-                    if (++nchecks > 32)
+                    if (++nchecks > 64)
                         return fails("overlap checks");
                 }
             // the reductions' lanes, and where the vector loop ends
