@@ -1,27 +1,147 @@
 // An object file compiled with -g keeps its debug information when the compilation
-// is split across worker processes: on Mach-O, combining the workers' parts with
-// `ld -r` would leave only a debug map pointing at the parts, which are deleted.
+// is split across worker processes: the debug information of every worker's part
+// is in the object file, which dsymutil and lldb read without complaint, and the
+// backtraces of a program linked from it have the file and line of each function,
+// whichever worker generated it. The optimized compilation inlines functions of the
+// other modules, so that the parts have copies of the same weak definitions, which
+// the object file has once.
 module test.dshell.parallel_debuginfo;
 
 import dshell;
-import std.algorithm : canFind;
+import std.algorithm : canFind, count, filter, splitter;
+import std.array : array;
+import std.format : format;
 import std.process : execute;
+import std.string : lineSplitter;
+
+enum modules = 4;
+
+string moduleSource(int k)
+{
+    // each module calls the function of the previous one, the first throws
+    return format(q{
+module m%1$d;
+%2$s
+T twice%1$d(T)(T x) { return x + x; }
+pragma(inline, true) int small%1$d(int x) { return x + %1$d; }
+int f%1$d(int x)
+{
+    if (x > 1000)
+        throw new Exception("too big");
+    auto r = %3$s;
+    return r + twice%1$d(x) + small%1$d(x) + cast(int) [x, 1, 2].length;
+}
+}, k, k ? format("import m%d;", k - 1) : "", k ? format("m%d.f%d(x * 10) + m%d.small%d(x)", k - 1, k - 1, k - 1, k - 1) : "x");
+}
+
+int check(string flags, string name)
+{
+    const dir = Vars.OUTPUT_BASE ~ "/" ~ name;
+    mkdirRecurse(dir);
+    string files;
+    foreach (k; 0 .. modules)
+    {
+        std.file.write(dir ~ format("/m%d.d", k), moduleSource(k));
+        files ~= format(" %s/m%d.d", dir, k);
+    }
+    std.file.write(dir ~ "/main.d", format(q{
+import m%d;
+void main() { f%d(1); }
+}, modules - 1, modules - 1));
+
+    const obj = dir ~ "/all" ~ Vars.OBJ;
+    const exe = dir ~ "/prog" ~ Vars.EXE;
+    run("$DMD -m$MODEL -j=" ~ format("%d", modules) ~ " -g " ~ flags ~ " -c -I" ~ dir ~ " -of=" ~ obj ~ files);
+    run("$DMD -m$MODEL -g -I" ~ dir ~ " -of=" ~ exe ~ " " ~ dir ~ "/main.d " ~ obj);
+
+    const sections = execute(["otool", "-l", obj]);
+    assert(sections.status == 0, sections.output);
+    if (!sections.output.canFind("__debug_info") || !sections.output.canFind("__debug_line"))
+    {
+        writeln(sections.output);
+        writeln(name, ": the object file has no debug information");
+        return 1;
+    }
+
+    // one compilation unit for each module, in the object file
+    const units = execute(["dwarfdump", "--debug-info", obj]);
+    assert(units.status == 0, units.output);
+    foreach (k; 0 .. modules)
+        if (!units.output.canFind(format("m%d.d", k)))
+        {
+            writeln(units.output);
+            writefln("%s: no compilation unit for m%d.d", name, k);
+            return 1;
+        }
+
+    const verify = execute(["dwarfdump", "--verify", obj]);
+    if (verify.status != 0)
+    {
+        writeln(verify.output);
+        writeln(name, ": dwarfdump --verify finds errors in the object file");
+        return 1;
+    }
+
+    // the backtrace of the exception thrown by f0, through the other functions, has
+    // the file and line of each of them that is not inlined
+    const bt = execute([exe, "x"]);
+    foreach (k; 0 .. modules)
+        if (!bt.output.canFind(format("m%d.d:", k)) && !flags.canFind("-O"))
+        {
+            writeln(bt.output);
+            writefln("%s: the backtrace has no line of m%d.d", name, k);
+            return 1;
+        }
+
+    // lldb finds the source line of every function, through the debug map
+    string[] lldbArgs = ["lldb", "--batch", "--no-lldbinit", exe];
+    foreach (k; 0 .. modules)
+        lldbArgs ~= ["-o", format("image lookup -n _D2m%1$d2f%1$dFiZi", k)];
+    const lookup = execute(lldbArgs);
+    foreach (k; 0 .. modules)
+        if (!lookup.output.canFind(format("m%d.d:", k)))
+        {
+            writeln(lookup.output);
+            writefln("%s: lldb finds no source line for m%d.f%d", name, k, k);
+            return 1;
+        }
+
+    // dsymutil links the debug information without warnings, a subprogram for each
+    // function once
+    const dsym = execute(["dsymutil", exe, "-o", exe ~ ".dSYM"]);
+    if (dsym.status != 0 || dsym.output.length)
+    {
+        writeln(dsym.output);
+        writeln(name, ": dsymutil warns");
+        return 1;
+    }
+    const linked = execute(["dwarfdump", "--debug-info", exe ~ ".dSYM"]);
+    assert(linked.status == 0, linked.output);
+    foreach (k; 0 .. modules)
+    {
+        const n = linked.output.lineSplitter.count!(l => l.canFind(format(`DW_AT_name	("f%d")`, k)));
+        if (n != 1)
+        {
+            writeln(linked.output);
+            writefln("%s: the dSYM has %d subprograms for m%d.f%d", name, n, k, k);
+            return 1;
+        }
+    }
+    const verifyDsym = execute(["dwarfdump", "--verify", exe ~ ".dSYM"]);
+    if (verifyDsym.status != 0)
+    {
+        writeln(verifyDsym.output);
+        writeln(name, ": dwarfdump --verify finds errors in the dSYM");
+        return 1;
+    }
+    return 0;
+}
 
 int main()
 {
     version (OSX) {} else return DISABLED;
 
-    std.file.write(Vars.OUTPUT_BASE ~ "/a.d", "module a; int a(int x) { return x * 3; }\n");
-    std.file.write(Vars.OUTPUT_BASE ~ "/b.d", "module b; import a; int b(int x) { return a.a(x) + 1; }\n");
-    run("$DMD -m$MODEL -j=2 -g -c -I$OUTPUT_BASE -of=$OUTPUT_BASE/ab$OBJ $OUTPUT_BASE/a.d $OUTPUT_BASE/b.d");
-
-    const sections = execute(["otool", "-l", Vars.OUTPUT_BASE ~ "/ab" ~ Vars.OBJ]);
-    assert(sections.status == 0, sections.output);
-    if (!sections.output.canFind("__debug_info") || !sections.output.canFind("__debug_line"))
-    {
-        writeln(sections.output);
-        writeln("the object file has no debug information");
-        return 1;
-    }
-    return 0;
+    if (auto r = check("", "debug"))
+        return r;
+    return check("-O -inline", "optimized");
 }
