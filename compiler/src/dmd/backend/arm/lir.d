@@ -11407,6 +11407,7 @@ private enum Neon : uint
     fneg4s = 0x6EA0F800, fabs4s = 0x4EA0F800, fsqrt4s = 0x6EA1F800,
     fcmeq4s = 0x4E20E400, fcmge4s = 0x6E20E400, fcmgt4s = 0x6EA0E400,
     scvtf4s = 0x4E21D800, ucvtf4s = 0x6E21D800, fcvtzs4s = 0x4EA1B800, fcvtzu4s = 0x6EA1B800,
+    fcvtms4s = 0x4E21B800,
     uxtl8h = 0x2F08A400, uxtl4s = 0x2F10A400, sxtl8h = 0x0F08A400, sxtl4s = 0x0F10A400,
     xtn4h = 0x0E612800, xtn8b = 0x0E212800,
     dup4sLane0 = 0x4E040400, zip1_4s = 0x4E803800, zip1_2d = 0x4EC03800, movi0 = 0x6F00E400,
@@ -11445,7 +11446,7 @@ private uint lanes64(uint templ)
         case Neon.cmeq4s, Neon.cmgt4s, Neon.cmge4s, Neon.cmhi4s, Neon.cmhs4s, Neon.cmtst4s:
         case Neon.fadd4s, Neon.fsub4s, Neon.fmul4s, Neon.fdiv4s, Neon.fneg4s, Neon.fabs4s, Neon.fsqrt4s:
         case Neon.fcmeq4s, Neon.fcmge4s, Neon.fcmgt4s:
-        case Neon.scvtf4s, Neon.ucvtf4s, Neon.fcvtzs4s, Neon.fcvtzu4s:
+        case Neon.scvtf4s, Neon.ucvtf4s, Neon.fcvtzs4s, Neon.fcvtzu4s, Neon.fcvtms4s:
             return templ | 0x0040_0000;     // the size 3, or for floats sz 1
         default:
             return 0;
@@ -12683,10 +12684,10 @@ private struct LoopVec
                     return no("conversion size");
                 r = vop(i.op == LOp.scvtf ? Neon.scvtf4s : Neon.ucvtf4s, A());
                 break;
-            case LOp.fcvtzs, LOp.fcvtzu:
+            case LOp.fcvtzs, LOp.fcvtzu, LOp.fcvtms:
                 if (i.sz != (d64 ? 8 : 4) || i.imm != (d64 ? 8 : 4))
                     return no("conversion size");
-                r = vop(i.op == LOp.fcvtzs ? Neon.fcvtzs4s : Neon.fcvtzu4s, A());
+                r = vop(i.op == LOp.fcvtzs ? Neon.fcvtzs4s : i.op == LOp.fcvtzu ? Neon.fcvtzu4s : Neon.fcvtms4s, A());
                 break;
             default:
                 return no("lane operation");
