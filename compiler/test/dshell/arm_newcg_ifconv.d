@@ -3,8 +3,8 @@
 // vectorization, each of its
 // functions named selN_... has at most N conditional branches, the choices
 // between values it makes being selects, each named extN_... at most N
-// sign or zero extensions, and each named opsN_... at most N instructions
-// but its return.
+// sign or zero extensions, each named divN_... at most N divisions, and each
+// named opsN_... at most N instructions but its return.
 module test.dshell.arm_newcg_ifconv;
 
 import dshell;
@@ -43,13 +43,13 @@ int main()
         // the conditional branches of each function, by the name its mangled name ends in
         const listing = readText(asmLog);
         string[] seen;
-        foreach (m; readText(src).matchAll(regex(`\b(sel|ext|ops)(\d+)_\w+`)))
+        foreach (m; readText(src).matchAll(regex(`\b(sel|ext|ops|div)(\d+)_\w+`)))
         {
             const fn = m.hit;
             if (seen.canFind(fn))
                 continue;
             seen ~= fn;
-            const ext = m[1] == "ext", ops = m[1] == "ops";
+            const ext = m[1] == "ext", ops = m[1] == "ops", div = m[1] == "div";
             const limit = m[2].to!uint;
             const tag = fn.length.to!string ~ fn;
             bool inFn, found;
@@ -68,13 +68,13 @@ int main()
                 if (!ins)
                     continue;
                 const op = ins[1];
-                if (ops ? op != "ret" : ext ? op == "uxtb" || op == "uxth" || op == "sxtb" || op == "sxth" || op == "sxtw" :
+                if (div ? op == "udiv" || op == "sdiv" : ops ? op != "ret" : ext ? op == "uxtb" || op == "uxth" || op == "sxtb" || op == "sxth" || op == "sxtw" :
                     op.startsWith("b.") && op != "b.al" || op == "cbz" || op == "cbnz" || op == "tbz" || op == "tbnz")
                     ++branches;
             }
             if (!found || branches > limit)
             {
-                writeln(name, ": ", fn, found ? " has " ~ branches.to!string ~ (ops ? " instructions" : ext ? " extensions" : " conditional branches") : " not found");
+                writeln(name, ": ", fn, found ? " has " ~ branches.to!string ~ (div ? " divisions" : ops ? " instructions" : ext ? " extensions" : " conditional branches") : " not found");
                 ++failures;
             }
         }

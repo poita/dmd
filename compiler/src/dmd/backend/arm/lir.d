@@ -7371,14 +7371,32 @@ private void numberValues()
     ver.setLength(vinfo.length);
     ver[][] = 0;
     uint verOf(Reg r) { return r && !isPhys(r) ? ver[r - firstVreg] : 0; }
-
     /* A hash table of the instructions seen in the segment: an entry is current while
      * its generation is the segment's, and a load's until a store that may reach its memory
      */
-    static struct Entry { uint gen; uint n; uint va, vb, vc; bool killed; uint writes; Footprint fp; }
+    static struct Entry { uint gen; uint n; uint va, vb, vc; bool killed; uint writes; Footprint fp; Reg ca, cb, cc; }
     enum tableSize = 512;
     Entry[tableSize] table;
     uint gen = 0;
+    /* the register a register defined once is a copy of, and its version then, as an
+     * operand is matched: the copy holds what that version of it does
+     */
+    Barray!Reg copySrc;
+    Barray!uint copyVer, copyGen;
+    copySrc.setLength(vinfo.length);
+    copySrc[][] = noReg;
+    copyVer.setLength(vinfo.length);
+    copyGen.setLength(vinfo.length);
+    scope (exit) { copySrc.dtor(); copyVer.dtor(); copyGen.dtor(); }
+    Reg canon(Reg r)
+    {
+        return r && !isPhys(r) && copySrc[r - firstVreg] && copyGen[r - firstVreg] == gen ? copySrc[r - firstVreg] : r;
+    }
+    uint canonVer(Reg r)
+    {
+        return r && !isPhys(r) && copySrc[r - firstVreg] && copyGen[r - firstVreg] == gen ? copyVer[r - firstVreg] : verOf(r);
+    }
+
     uint nwrites;                   // the number of instructions writing memory so far
     Barray!uint liveLoads;          // the entries of the loads not yet killed
     // the stores whose values may be read back: the store, the versions of its base and value
@@ -7394,12 +7412,12 @@ private void numberValues()
             verOf(f.base) == va;
         return mayAlias(f, lf, same);
     }
-    static size_t hashOf(ref const LIns i)
+    static size_t hashOf(ref const LIns i, Reg ra, Reg rb, Reg rc)
     {
         size_t h = i.op * 31 + i.sz;
-        h = h * 131 + i.a;
-        h = h * 131 + i.b;
-        h = h * 131 + i.c;
+        h = h * 131 + ra;
+        h = h * 131 + rb;
+        h = h * 131 + rc;
         h = h * 131 + cast(size_t)i.imm;
         /* a symbol by what tells it apart in the function, not by its address, so
          * which instructions the table keeps does not change from one compilation
@@ -7506,7 +7524,9 @@ private void numberValues()
             if (candidate)
             {
                 const isLoad = i.op == LOp.ld;
-                size_t h = hashOf(*i) & (tableSize - 1);
+                const ca = canon(i.a), cb = canon(i.b), cc = canon(i.c);
+                const cva = canonVer(i.a), cvb = canonVer(i.b), cvc = canonVer(i.c);
+                size_t h = hashOf(*i, ca, cb, cc) & (tableSize - 1);
                 bool found;
                 foreach (probe; 0 .. 8)
                 {
@@ -7516,7 +7536,7 @@ private void numberValues()
                         // a free slot: remember this one, unless the table is getting full
                         if (count < tableSize / 2)
                         {
-                            *x = Entry(gen, cast(uint)n, verOf(i.a), verOf(i.b), verOf(i.c), false, nwrites);
+                            *x = Entry(gen, cast(uint)n, cva, cvb, cvc, false, nwrites, Footprint.init, ca, cb, cc);
                             if (isLoad)
                             {
                                 x.fp = footprint(*i);
@@ -7528,14 +7548,14 @@ private void numberValues()
                     }
                     const k = &ins[x.n];
                     if (k.op == i.op && k.sz == i.sz && k.cond == i.cond && k.flags == i.flags &&
-                        k.a == i.a && k.b == i.b && k.c == i.c && k.imm == i.imm && k.sym == i.sym &&
-                        x.va == verOf(i.a) && x.vb == verOf(i.b) && x.vc == verOf(i.c) &&
+                        x.ca == ca && x.cb == cb && x.cc == cc && k.imm == i.imm && k.sym == i.sym &&
+                        x.va == cva && x.vb == cvb && x.vc == cvc &&
                         rcOf(k.d) == rcOf(i.d))
                     {
                         if (isLoad && x.killed)
                         {
                             // what is in memory now is read here instead
-                            *x = Entry(gen, cast(uint)n, verOf(i.a), verOf(i.b), verOf(i.c), false, nwrites);
+                            *x = Entry(gen, cast(uint)n, cva, cvb, cvc, false, nwrites, Footprint.init, ca, cb, cc);
                             x.fp = footprint(*i);
                             liveLoads.push(cast(uint)((h + probe) & (tableSize - 1)));
                             break;
@@ -7555,6 +7575,14 @@ private void numberValues()
             }
             if (i.d && !isPhys(i.d))
                 ++ver[i.d - firstVreg];
+            // a whole copy of a register into one defined only here holds what that does now
+            if (candidate && i.op == LOp.copy && i.a && rcOf(i.a) == rcOf(i.d) &&
+                (i.sz == 8 || i.sz == 4 && vi(i.a).sz <= 4))
+            {
+                copySrc[i.d - firstVreg] = canon(i.a);
+                copyVer[i.d - firstVreg] = canonVer(i.a);
+                copyGen[i.d - firstVreg] = gen;
+            }
         }
     }
     if (any)
