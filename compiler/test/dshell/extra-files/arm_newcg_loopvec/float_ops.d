@@ -55,6 +55,19 @@ void vecToInt(int[] c, const(float)[] a)
         c[i] = cast(int)(a[i] * 2.5f);
 }
 
+// the truncation fixed up to round down, as fcvtms
+int ifloor(float x)
+{
+    const i = cast(int) x;
+    return x < i ? i - 1 : i;
+}
+
+void vecFloor(int[] c, const(float)[] a)
+{
+    foreach (i; 0 .. c.length)
+        c[i] = ifloor(a[i] * 3.0f);
+}
+
 void vecFromInt(float[] c, const(int)[] a)
 {
     foreach (i; 0 .. c.length)
@@ -125,6 +138,8 @@ int main()
         foreach (i; 0 .. n) check(same(c[i], id(a[i]) != b[i] ? 1.0f : 2.0f));
         vecToInt(ic, a);
         foreach (i; 0 .. n) check(ic[i] == cast(int)(id(a[i]) * 2.5f));
+        vecFloor(ic, a);
+        foreach (i; 0 .. n) check(ic[i] == ifloor(id(a[i]) * 3.0f));
         vecFromInt(c, ia);
         foreach (i; 0 .. n) check(same(c[i], cast(float)idi(ia[i]) * 0.5f));
         vecZeroCompare(c, a);
