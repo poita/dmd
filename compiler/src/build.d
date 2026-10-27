@@ -1396,7 +1396,7 @@ auto sourceFiles()
             dinterpret.d dmacro.d dmodule.d doc.d dscope.d dstruct.d dsymbol.d dsymbolsem.d
             dtemplate.d dtoh.d dversion.d enumsem.d escape.d expression.d expressionsem.d func.d funcsem.d hdrgen.d
             impcnvtab.d imphint.d importc.d init.d initsem.d inline.d inlinecost.d intrange.d json.d lambdacomp.d
-            mtype.d mustuse.d nogc.d nspace.d ob.d objc.d opover.d optimize.d parallel.d
+            machomerge.d mtype.d mustuse.d nogc.d nspace.d ob.d objc.d opover.d optimize.d parallel.d
             parse.d pragmasem.d printast.d rootobject.d safe.d
             semantic2.d semantic3.d sideeffect.d statement.d
             statementsem.d staticassert.d staticcond.d stmtstate.d target.d targetcompiler.d templatesem.d templateparamsem.d traits.d

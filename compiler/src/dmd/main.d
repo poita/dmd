@@ -812,12 +812,13 @@ private int tryMain(const(char)[][] argv, out Param params)
 
     /* Split the code generation of the root modules across worker processes, which
      * start from the state of this process once everything but code generation is
-     * done. On Mach-O, the parts of one object file are combined with `ld -r`, which
-     * replaces their debug information with a debug map pointing at the parts, so an
-     * object file with debug information is not split.
+     * done. The parts of one object file are merged by `mergeObjects`, which keeps
+     * their debug information but on x86-64 Mach-O, where `ld -r` replaces it with a
+     * debug map pointing at the parts: an object file with debug information is not
+     * split there.
      */
     const debugMap = driverParams.symdebug && driverParams.oneobj && !driverParams.lib &&
-        target.objectFormat() == Target.ObjectFormat.macho;
+        target.objectFormat() == Target.ObjectFormat.macho && !target.isAArch64;
     if (driverParams.workers != 1 && params.obj && !includeImports && !params.addMain && !debugMap &&
         !params.json.doOutput && !params.ddoc.doOutput && !params.vcg_ast &&
         !params.cxxhdr.doOutput && !params.moduleDeps.buffer && !params.dihdr.doOutput &&
@@ -849,7 +850,9 @@ private int tryMain(const(char)[][] argv, out Param params)
                 auto parts = partNames(output, workers.count);
                 if (workers.succeeded)
                     workers.succeeded = driverParams.lib ? mergeLibraries(output, libmodules[], parts) :
-                                                           mergeObjects(output, parts);
+                                                           mergeObjects(output, parts,
+                            target.objectFormat() == Target.ObjectFormat.macho && target.isAArch64,
+                            driverParams.symdebug != 0);
                 removeParts(parts);
             }
         }

@@ -26,7 +26,7 @@ T twice%1$d(T)(T x) { return x + x; }
 pragma(inline, true) int small%1$d(int x) { return x + %1$d; }
 int f%1$d(int x)
 {
-    if (x > 1000)
+    if (x >= 1000)
         throw new Exception("too big");
     auto r = %3$s;
     return r + twice%1$d(x) + small%1$d(x) + cast(int) [x, 1, 2].length;
@@ -51,7 +51,16 @@ void main() { f%d(1); }
 
     const obj = dir ~ "/all" ~ Vars.OBJ;
     const exe = dir ~ "/prog" ~ Vars.EXE;
-    run("$DMD -m$MODEL -j=" ~ format("%d", modules) ~ " -g " ~ flags ~ " -c -I" ~ dir ~ " -of=" ~ obj ~ files);
+    // the compilation is split, and the parts merged into the object file
+    const log = dir ~ "/split.log";
+    run("$DMD -m$MODEL -j=" ~ format("%d", modules) ~ " -g " ~ flags ~ " -c -I" ~ dir ~ " -of=" ~ obj ~ files,
+        stdout, stderr, ["DMD_SPLIT_LOG": log]);
+    const splitLog = std.file.readText(log);
+    if (!splitLog.canFind("succeeded") || splitLog.canFind("not done"))
+    {
+        writeln(name, ": ", splitLog);
+        return 1;
+    }
     run("$DMD -m$MODEL -g -I" ~ dir ~ " -of=" ~ exe ~ " " ~ dir ~ "/main.d " ~ obj);
 
     const sections = execute(["otool", "-l", obj]);
@@ -119,7 +128,7 @@ void main() { f%d(1); }
     assert(linked.status == 0, linked.output);
     foreach (k; 0 .. modules)
     {
-        const n = linked.output.lineSplitter.count!(l => l.canFind(format(`DW_AT_name	("f%d")`, k)));
+        const n = linked.output.lineSplitter.count!(l => l.canFind(format(`DW_AT_name	("m%d.f%d")`, k, k)));
         if (n != 1)
         {
             writeln(linked.output);

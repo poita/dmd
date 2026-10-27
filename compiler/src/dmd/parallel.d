@@ -1111,15 +1111,35 @@ void removeParts(const(char)[][] parts)
 }
 
 /**************************************
- * Combine object file parts into one object file with `ld -r`.
+ * Combine object file parts into one object file: AArch64 Mach-O ones in this process
+ * (see `dmd.machomerge`), which keeps their debug information, others with `ld -r`.
  * Params:
  *      objfile = the object file to write
  *      parts = the object files to combine
+ *      machoAArch64 = the parts are AArch64 Mach-O object files
+ *      debugInfo = the parts have debug information, which `ld -r` does not keep on
+ *          Mach-O
  * Returns:
  *      true on success
  */
-bool mergeObjects(const(char)[] objfile, const(char)[][] parts)
+bool mergeObjects(const(char)[] objfile, const(char)[][] parts, bool machoAArch64, bool debugInfo)
 {
+    if (machoAArch64)
+    {
+        const(char)[] reason;
+        if (mergeMachO(objfile, parts, reason))
+            return true;
+        if (const log = getenv("DMD_SPLIT_LOG"))
+        {
+            if (FILE* f = fopen(log, "a"))
+            {
+                fprintf(f, "merge of the parts not done: %.*s\n", cast(int)reason.length, reason.ptr);
+                fclose(f);
+            }
+        }
+        if (debugInfo)
+            return false;
+    }
     version (Posix)
     {
         stressPause(StressPoint.merge);
@@ -1153,6 +1173,44 @@ bool mergeObjects(const(char)[] objfile, const(char)[][] parts)
     }
     else
         return false;
+}
+
+/* Merge the Mach-O object files `parts` into `objfile`.
+ * Returns: true on success, otherwise false with `reason` set
+ */
+private bool mergeMachO(const(char)[] objfile, const(char)[][] parts, out const(char)[] reason)
+{
+    import dmd.common.outbuffer : OutBuffer;
+    import dmd.machomerge : mergeMachObjects;
+    import dmd.root.file : File;
+
+    const(ubyte)[][] contents;
+    foreach (p; parts)
+    {
+        OutBuffer buf;
+        if (File.read(p, buf))
+        {
+            reason = "cannot read a part";
+            return false;
+        }
+        contents ~= cast(const(ubyte)[])buf.extractSlice();
+    }
+    ubyte[] merged;
+    if (!mergeMachObjects(contents, merged, reason))
+        return false;
+    const tmpfile = mergeTemporary(objfile);
+    if (!File.write(tmpfile, merged))
+    {
+        reason = "cannot write the object file";
+        return false;
+    }
+    if (rename(toCString(tmpfile), toCString(objfile)) != 0)
+    {
+        remove(toCString(tmpfile));
+        reason = "cannot rename the object file";
+        return false;
+    }
+    return true;
 }
 
 private const(char)* toCString(const(char)[] s)
