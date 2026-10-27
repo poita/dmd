@@ -819,7 +819,15 @@ private int tryMain(const(char)[][] argv, out Param params)
      */
     const debugMap = driverParams.symdebug && driverParams.oneobj && !driverParams.lib &&
         target.objectFormat() == Target.ObjectFormat.macho && !target.isAArch64;
+    /* Forking workers from a process that has done the whole frontend copies much of
+     * its memory, which costs more than the workers save on the code generation of
+     * one object file with debug information, so it is split only when `-j` asks for
+     * workers
+     */
+    const debugObject = driverParams.symdebug && driverParams.oneobj && !driverParams.lib &&
+        driverParams.workers == 0;
     if (driverParams.workers != 1 && params.obj && !includeImports && !params.addMain && !debugMap &&
+        !debugObject &&
         !params.json.doOutput && !params.ddoc.doOutput && !params.vcg_ast &&
         !params.cxxhdr.doOutput && !params.moduleDeps.buffer && !params.dihdr.doOutput &&
         !params.timeTrace && !params.v.verbose && !params.v.templates && !params.makeDeps.doOutput)
