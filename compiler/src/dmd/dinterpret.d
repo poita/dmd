@@ -326,7 +326,7 @@ public:
 
     bool isInCurrentFrame(VarDeclaration v)
     {
-        if (v.isDataseg() && !v.isCTFE())
+        if (!v.isCTFE() && v.isDataseg())
             return false; // It's a global
         return v.ctfeAdrOnStack >= framepointer;
     }
@@ -334,7 +334,7 @@ public:
     Expression getValue(VarDeclaration v)
     {
         //printf("getValue() %s\n", v.toChars());
-        if ((v.isDataseg() || v.storage_class & STC.manifest) && !v.isCTFE())
+        if (!v.isCTFE() && (v.isDataseg() || v.storage_class & STC.manifest))
         {
             assert(v.ctfeAdrOnStack < globalValues.length);
             return globalValues[v.ctfeAdrOnStack];
@@ -2179,7 +2179,7 @@ public:
 
                 e = interpret(e, istate);
             }
-            else if (!(v.isDataseg() || v.storage_class & STC.manifest) && !v.isCTFE() && !istate)
+            else if (!v.isCTFE() && !istate && !(v.isDataseg() || v.storage_class & STC.manifest))
             {
                 eSink.error(loc, "variable `%s` cannot be read at compile time", v.toErrMsg());
                 return CTFEExp.cantexp;
