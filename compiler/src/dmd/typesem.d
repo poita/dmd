@@ -1137,6 +1137,7 @@ Type makeConst(Type _this)
  * If _this is a shell around another type,
  * get that other type.
  */
+pragma(inline, true)
 Type toBasetype(Type _this)
 {
     /* This function is used heavily.
