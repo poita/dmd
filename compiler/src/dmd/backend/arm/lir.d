@@ -7684,7 +7684,7 @@ private void removeRedundantExtensions()
     const nv = vinfo.length;
     bool anyExt;
     foreach (ref i; ins[])
-        anyExt |= (i.op == LOp.zext || i.op == LOp.sext) && i.a && !isPhys(i.a);
+        anyExt |= (i.op == LOp.zext || i.op == LOp.sext || i.op == LOp.andi) && i.a && !isPhys(i.a);
     if (!anyExt)
         return;
     Barray!ubyte bits;
@@ -7805,6 +7805,21 @@ private void removeRedundantExtensions()
     }
     foreach (ref i; ins[])
     {
+        // a mask keeping every bit the value can have set, as of a 0 or 1 & 1
+        if (i.op == LOp.andi && i.a && !isPhys(i.a) && i.d && !isPhys(i.d) && rcOf(i.a) == RC.gp &&
+            rcOf(i.d) == RC.gp)
+        {
+            const n = bitsOf(i.a);
+            const ulong m = i.sz == 4 ? cast(uint)i.imm : cast(ulong)i.imm;
+            const ulong low = n >= 64 ? ulong.max : (1UL << n) - 1;
+            if (n < 64 && (i.sz == 8 || n <= 32) && (m & low) == low)
+            {
+                i.op = LOp.copy;
+                i.sz = 8;
+                i.imm = 0;
+            }
+            continue;
+        }
         if (i.op != LOp.zext && i.op != LOp.sext || !i.a || isPhys(i.a) || !i.d || isPhys(i.d) ||
             rcOf(i.a) != RC.gp || rcOf(i.d) != RC.gp || i.imm >= 64)
             continue;
