@@ -14498,15 +14498,24 @@ private void foldDominatedTests(bool repeats)
     const ns = segStart.length - 1;
     if (ns < 2)
         return;
+    {
+        // a test is decided by another, and a comparison made again repeats one
+        uint ntests;
+        foreach (ref i; ins[])
+            ntests += i.op == LOp.cmp || i.op == LOp.cmpi || i.op == LOp.fcmp || i.op == LOp.fcmpz ||
+                i.op == LOp.cbz;
+        if (ntests < 2)
+            return;
+    }
     Barray!uint psuccStart, psucc, ppredStart, ppreds;
-    Barray!uint ndefs, defAt, rpo, rpoNum, idom, stack, next;
+    Barray!uint ndefs, defAt, rpo;
     Barray!Fact facts;
     Barray!uint factStart, factEnd;
     Barray!bool seen, changedBlock;
     scope (exit)
     {
         psuccStart.dtor(); psucc.dtor(); ppredStart.dtor(); ppreds.dtor();
-        ndefs.dtor(); defAt.dtor(); rpo.dtor(); rpoNum.dtor(); idom.dtor(); stack.dtor(); next.dtor();
+        ndefs.dtor(); defAt.dtor(); rpo.dtor();
         facts.dtor(); factStart.dtor(); factEnd.dtor(); seen.dtor(); changedBlock.dtor();
     }
     physicalFlow(psuccStart, psucc, ppredStart, ppreds);
@@ -14597,182 +14606,137 @@ private void foldDominatedTests(bool repeats)
         return true;
     }
 
-    // reverse postorder of the physical flow, and the immediate dominators
-    rpoNum.setLength(ns);
-    rpoNum[][] = uint.max;
-    {
-        Barray!uint post;
-        scope (exit) post.dtor();
-        seen.setLength(ns);
-        seen[][] = false;
-        next.setLength(ns);
-        next[][] = 0;
-        stack.push(0);
-        seen[0] = true;
-        while (stack.length)
-        {
-            const v = stack[stack.length - 1];
-            const k = psuccStart[v] + next[v];
-            if (k < psuccStart[v + 1])
-            {
-                ++next[v];
-                const t = psucc[k];
-                if (!seen[t])
-                {
-                    seen[t] = true;
-                    stack.push(t);
-                }
-            }
-            else
-            {
-                post.push(v);
-                stack.setLength(stack.length - 1);
-            }
-        }
-        foreach_reverse (v; post[])
-        {
-            rpoNum[v] = cast(uint)rpo.length;
-            rpo.push(v);
-        }
-    }
-    idom.setLength(ns);
-    idom[][] = uint.max;
-    idom[0] = 0;
-    for (bool changed = true; changed; )
-    {
-        changed = false;
-        foreach (v; rpo[][1 .. $])
-        {
-            uint d = uint.max;
-            foreach (p; ppreds[ppredStart[v] .. ppredStart[v + 1]])
-            {
-                if (idom[p] == uint.max)
-                    continue;
-                if (d == uint.max)
-                {
-                    d = p;
-                    continue;
-                }
-                uint a = p, b = d;
-                while (a != b)
-                {
-                    while (rpoNum[a] > rpoNum[b]) a = idom[a];
-                    while (rpoNum[b] > rpoNum[a]) b = idom[b];
-                }
-                d = a;
-            }
-            if (d != uint.max && idom[v] != d)
-            {
-                idom[v] = d;
-                changed = true;
-            }
-        }
-    }
-
-    // the facts at the end of each segment, those after the defining instructions it has
-    enum maxFacts = 12;
-    factStart.setLength(ns);
-    factEnd.setLength(ns);
-    factStart[][] = 0;
-    factEnd[][] = 0;
     bool any;
     changedBlock.setLength(blocks.length);
     changedBlock[][] = false;
-    foreach (v; rpo[])
+    // the tests decided, done once, before the passes that follow a branch to its comparison
+    if (!repeats)
     {
-        const from = cast(uint)facts.length;
-        if (v != 0)
+        // the dominator tree, of a graph with at least the edges the code takes, in preorder
+        Dominators dom;
+        Barray!uint dpredStart, dpreds;
+        scope (exit) { dom.dtor(); dpredStart.dtor(); dpreds.dtor(); }
+        findLoops(dpredStart, dpreds, null, &dom);
+        // enter numbers the entries and leavings of the tree together
+        rpo.setLength(2 * ns);
+        rpo[][] = uint.max;
+        foreach (v; 0 .. ns)
+            if (dom.depth[v])
+                rpo[dom.enter[v]] = cast(uint)v;
+        uint nreached;
+        foreach (k; 0 .. 2 * ns)
+            if (rpo[k] != uint.max)
+                rpo[nreached++] = rpo[k];
+        rpo.setLength(nreached);
+        const idom = dom.idom[];
+
+        // the facts at the end of each segment, those after the defining instructions it has
+        enum maxFacts = 12;
+        Barray!uint definedIn;      // by register: 1 + the last segment found to define it
+        scope (exit) definedIn.dtor();
+        definedIn.setLength(vinfo.length);
+        definedIn[][] = 0;
+        factStart.setLength(ns);
+        factEnd.setLength(ns);
+        factStart[][] = 0;
+        factEnd[][] = 0;
+        foreach (v; rpo[])
         {
-            // the only segment going to v, if one
-            uint pred = uint.max;
-            bool single = true;
-            foreach (p; ppreds[ppredStart[v] .. ppredStart[v + 1]])
+            const from = cast(uint)facts.length;
+            if (v != 0)
             {
-                if (pred != uint.max && p != pred)
-                    single = false;
-                pred = p;
-            }
-            if (pred == uint.max)
-                single = false;
-            const d = idom[v];
-            if (single && pred == d)
-            {
-                foreach (k; factStart[d] .. factEnd[d])
-                    facts.push(facts[k]);
-            }
-            else if (d != uint.max)
-            {
-                foreach (k; factStart[d] .. factEnd[d])
-                    if (facts[k].global)
-                        facts.push(facts[k]);
-            }
-            Test t;
-            uint cond, at, brAt;
-            if (single && endTest(pred, t, cond, at, brAt))
-            {
-                const LIns* br = &ins[brAt];
-                const taken = br.flags & F.toLabel ? labelSeg[br.target] : blockSeg[br.target];
-                uint fall = uint.max;
-                foreach (s; psucc[psuccStart[pred] .. psuccStart[pred + 1]])
-                    if (s != taken)
-                        fall = s;
-                if ((v == taken) != (v == fall))
+                // the only segment going to v, if one
+                uint pred = uint.max;
+                bool single = true;
+                foreach (p; ppreds[ppredStart[v] .. ppredStart[v + 1]])
                 {
-                    Fact f;
-                    f.t = t;
-                    f.cond = cast(ubyte)cond;
-                    f.holds = v == taken;
-                    f.global = once(t.a) && once(t.b);
-                    facts.push(f);
+                    if (pred != uint.max && p != pred)
+                        single = false;
+                    pred = p;
+                }
+                if (pred == uint.max)
+                    single = false;
+                const d = idom[v];
+                if (single && pred == d)
+                {
+                    foreach (k; factStart[d] .. factEnd[d])
+                        facts.push(facts[k]);
+                }
+                else if (d != uint.max)
+                {
+                    foreach (k; factStart[d] .. factEnd[d])
+                        if (facts[k].global)
+                            facts.push(facts[k]);
+                }
+                Test t;
+                uint cond, at, brAt;
+                if (single && endTest(pred, t, cond, at, brAt))
+                {
+                    const LIns* br = &ins[brAt];
+                    const taken = br.flags & F.toLabel ? labelSeg[br.target] : blockSeg[br.target];
+                    uint fall = uint.max;
+                    foreach (s; psucc[psuccStart[pred] .. psuccStart[pred + 1]])
+                        if (s != taken)
+                            fall = s;
+                    if ((v == taken) != (v == fall))
+                    {
+                        Fact f;
+                        f.t = t;
+                        f.cond = cast(ubyte)cond;
+                        f.holds = v == taken;
+                        f.global = once(t.a) && once(t.b);
+                        facts.push(f);
+                    }
                 }
             }
-        }
-        // the facts the segment's definitions leave, at most maxFacts, the nearest
-        uint keep = from;
-        foreach (k; from .. cast(uint)facts.length)
-        {
-            Fact f = facts[k];
-            bool killed;
-            foreach (n; segStart[v] .. segEnd(v))
+            // the facts the segment's definitions leave, at most maxFacts, the nearest
+            bool local;
+            foreach (k; from .. cast(uint)facts.length)
+                local |= !facts[k].global;
+            if (local)
+                foreach (n; segStart[v] .. segEnd(v))
+                    if (ins[n].d && !isPhys(ins[n].d))
+                        definedIn[ins[n].d - firstVreg] = v + 1;
+            bool killedBy(Reg r) { return r && !isPhys(r) && definedIn[r - firstVreg] == v + 1; }
+            uint keep = from;
+            foreach (k; from .. cast(uint)facts.length)
             {
-                const r = ins[n].d;
-                if (r && (r == f.t.a || r == f.t.b))
-                    killed = true;
+                Fact f = facts[k];
+                if (f.global || !killedBy(f.t.a) && !killedBy(f.t.b))
+                    facts[keep++] = f;
             }
-            if (!killed)
-                facts[keep++] = f;
-        }
-        facts.setLength(keep);
-        factStart[v] = keep - from > maxFacts ? keep - maxFacts : from;
-        factEnd[v] = keep;
+            facts.setLength(keep);
+            factStart[v] = keep - from > maxFacts ? keep - maxFacts : from;
+            factEnd[v] = keep;
 
-        // the segment's own test, decided by the facts before it, or the same as the one before it
-        Test t;
-        uint cond, at, brAt;
-        if (!endTest(v, t, cond, at, brAt))
-            continue;
-        int outcome = -1;
-        foreach_reverse (k; factStart[v] .. factEnd[v])
-        {
-            outcome = decideTest(facts[k], t, cond);
-            if (outcome >= 0)
-                break;
-        }
-        LIns* br = &ins[brAt];
-        if (outcome >= 0)
-        {
-            if (outcome)
+            // the segment's own test, decided by the facts before it, or the same as the one before it
+            Test t;
+            uint cond, at, brAt;
+            if (!endTest(v, t, cond, at, brAt))
+                continue;
+            int outcome = -1;
+            foreach_reverse (k; factStart[v] .. factEnd[v])
             {
-                br.op = LOp.br;
-                br.cond = COND.al;
-                br.a = noReg;
-                br.imm = 0;
+                outcome = decideTest(facts[k], t, cond);
+                if (outcome >= 0)
+                    break;
             }
-            else
-                *br = LIns.init;
-            any = true;
-            changedBlock[segBlock[v]] = true;
-            continue;
+            LIns* br = &ins[brAt];
+            if (outcome >= 0)
+            {
+                if (outcome)
+                {
+                    br.op = LOp.br;
+                    br.cond = COND.al;
+                    br.a = noReg;
+                    br.imm = 0;
+                }
+                else
+                    *br = LIns.init;
+                any = true;
+                changedBlock[segBlock[v]] = true;
+                continue;
+            }
         }
     }
 
@@ -14781,7 +14745,7 @@ private void foldDominatedTests(bool repeats)
      * comparison whose branch is all that leads to it in its block
      */
     if (repeats)
-        foreach (v; rpo[])
+        foreach (v; 0 .. cast(uint)ns)
         {
             uint last = uint.max;     // the comparison the flags are of
             uint pred = uint.max;
