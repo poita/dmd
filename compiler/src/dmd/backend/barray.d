@@ -23,6 +23,25 @@ nothrow:
 
 import dmd.backend.global : err_nomem;
 
+/* With the environment variable DMD_BARRAY_FILL set to a byte value, the elements an
+ * array grows by are filled with it, rather than left as realloc() leaves them, so that
+ * code reading elements it has not written does the same in every run: compiling with
+ * different values shows whether the output depends on such reads.
+ * -2 until the variable is read, -1 if it is not set.
+ */
+private __gshared int fillByte = -2;
+
+@trusted
+private int growthFill()
+{
+    if (fillByte == -2)
+    {
+        const s = getenv("DMD_BARRAY_FILL");
+        fillByte = s ? atoi(s) & 0xFF : -1;
+    }
+    return fillByte;
+}
+
 /*************************************
  * A reusable array that ratchets up in capacity.
  */
@@ -41,6 +60,7 @@ struct Barray(T)
             pragma(inline, false);
             assert(length < size_t.max / (2 * T.sizeof));       // conservative overflow check
             auto newcap = (barray.capacity == 0) ? length : length + (length >> 1);
+            const oldcap = barray.capacity;
             barray.capacity = (newcap + 15) & ~15;
             T* p = cast(T*)realloc(barray.array.ptr, barray.capacity * T.sizeof);
             if (length && !p)
@@ -50,6 +70,9 @@ struct Barray(T)
                 else
                     err_nomem();
             }
+            const fill = growthFill();
+            if (fill >= 0)
+                memset(p + oldcap, fill, (barray.capacity - oldcap) * T.sizeof);
             barray.array = p[0 .. length];
         }
 
