@@ -254,6 +254,42 @@ double floats(const(double)[] a, double t)
     return s;
 }
 
+// a nested function changes the condition's variable through the frame
+pragma(inline, false)
+int nestedFunctionWrites(int n)
+{
+    int k = 0;
+    pragma(inline, false) void step() { ++k; }
+    int s;
+    foreach (i; 0 .. n)
+    {
+        if (k < 2)
+            s += 1;
+        else
+            s += 10;
+        step();
+    }
+    return s;
+}
+
+// a delegate changes it through a closure
+pragma(inline, false)
+int delegateWrites(int n, ref void delegate() dg)
+{
+    int k = 0;
+    dg = () { ++k; };
+    int s;
+    foreach (i; 0 .. n)
+    {
+        if (k < 2)
+            s += 1;
+        else
+            s += 10;
+        dg();
+    }
+    return s;
+}
+
 // a loop on the way to a throw only
 pragma(inline, false)
 void coldLoop(const(int)[] a, bool flag)
@@ -345,6 +381,10 @@ void main()
 
     check(floats([1.0, 2.0], 2.0) == 6.0);
     check(floats([1.0, 2.0], double.nan) == -3.0);
+
+    check(nestedFunctionWrites(4) == 22);
+    void delegate() dg;
+    check(delegateWrites(4, dg) == 22);
 
     foreach (flag; [false, true])
     {

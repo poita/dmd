@@ -4509,7 +4509,7 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     enum maxLoopCost = 200;         // elem nodes in the loop to be copied
     enum maxFunctionGrowth = 400;   // elem nodes copied in the whole function
 
-    // a limit on the loops unswitched in a function, whatever becomes of the marks on their blocks
+    // a limit on the loops unswitched in a function
     enum maxPerFunction = 8;
     if (go.unswitched >= maxPerFunction)
         return false;
@@ -4542,11 +4542,7 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
             if (b is head ? !inLoop(p) && p !is pre : !inLoop(p))
                 return false;
 
-    int growth = 0;
-    foreach (b; bo.dfo[])
-        if (b.Bflags & BFL.unswitched && b.Belem)
-            growth += el_length(b.Belem);
-    if (growth / 2 + cost > maxFunctionGrowth)
+    if (go.unswitchGrowth + cost > maxFunctionGrowth)
         return false;
 
     /* The variables the loop assigns, and whether it may write other memory,
@@ -4563,9 +4559,7 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
             const op = e.Eoper;
             switch (op)
             {
-                case OPcall: case OPcallns: case OPucall: case OPucallns:
-                case OPmemcpy: case OPmemset: case OPstrcpy: case OPstrcat:
-                case OPvecsto: case OPcmpxchg: case OPhalt: case OPasm:
+                case OPcallns: case OPucallns: case OPhalt: case OPva_start:
                     writesMemory = true;
                     break;
                 case OPctor: case OPdtor: case OPdctor: case OPmark: case OPddtor:
@@ -4574,13 +4568,10 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
                 default:
                     break;
             }
-            if (OTassign(op))
-            {
-                if (e.E1.Eoper == OPvar)
-                    defs.push(e.E1.Vsym);
-                else
-                    writesMemory = true;
-            }
+            if (OTassign(op) && e.E1.Eoper == OPvar)
+                defs.push(e.E1.Vsym);
+            else if (OTdef(op))
+                writesMemory = true;
             if (OTleaf(op))
                 return;
             if (OTbinary(op))
@@ -4797,6 +4788,7 @@ private bool loopunswitch(ref GlobalOptimizer go, ref BlockOpt bo, ref Loop l)
     *pcond = el_long(ty, 1);
 
     ++go.unswitched;
+    go.unswitchGrowth += cost;
     block_pred(bo.startblock);
     go.changes++;
     return true;

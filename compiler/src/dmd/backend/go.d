@@ -107,6 +107,7 @@ struct GlobalOptimizer
     Aetype aetype;      // cse, arraybounds
     uint changes;       // # of optimizations performed
     uint unswitched;    // # of loops unswitched in the function
+    uint unswitchGrowth; // elem nodes copied by unswitching in the function
     int flowxx;         // AE, CP or VBE
 
     Barray!DefNode defnod;    // array of definition elems
@@ -528,6 +529,7 @@ void optfunc(ref GlobalOptimizer go, ref BlockOpt bo)
     bo.assertsSplit = false;
     bo.exitsFound = false;
     go.unswitched = 0;
+    go.unswitchGrowth = 0;
     int iter = 0;           // iteration count
     /* The loop optimizations and boolopt() run again only after a round in which
      * they changed something: what the other optimizations change rarely gives
