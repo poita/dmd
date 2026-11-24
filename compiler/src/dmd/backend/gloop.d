@@ -2281,6 +2281,12 @@ private void findbasivs(ref GlobalOptimizer go, ref Loop l)
         if (tycomplex(s.ty()))
                 continue;
 
+        // Nor floating-point ones: rounding makes `biv * c` recomputed and
+        // `t += step * c` carried along differ, and both must give the
+        // same bits wherever the program runs
+        if (tyfloating(s.ty()))
+            continue;
+
         auto biv = l.Livlist.push();
         biv.IVbasic = s;               // symbol of basic IV
         biv.IVincr = null;
@@ -2503,7 +2509,7 @@ private void ivfamelems(Iv* biv,elem** pn)
     else                                /* else leaf elem               */
         return;                         /* which can't be in the family */
 
-    if (tycomplex(n.Ety))
+    if (tyfloating(n.Ety))
         return;
 
     if (op == OPmul || op == OPadd || op == OPmin ||
