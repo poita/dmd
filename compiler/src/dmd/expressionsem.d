@@ -2226,7 +2226,17 @@ private Expression searchUFCS(Scope* sc, UnaExp ue, Identifier ident)
                 continue;
             if (scx.scopesym.isModule())
                 flags |= SearchOpt.unqualifiedModule;    // tell Module.search() that SearchOpt.localsOnly is to be obeyed
-            s = scx.scopesym.search(loc, ident, flags);
+            {
+                // UFCS only considers module scope symbols, so a member later inserted
+                // into a non-module scope cannot change the result: don't record absence there
+                import dmd.orderdep;
+                const suspend = !scx.scopesym.isModule();
+                if (suspend)
+                    orderCheckSuspend();
+                s = scx.scopesym.search(loc, ident, flags);
+                if (suspend)
+                    orderCheckResume();
+            }
             if (s)
             {
                 // overload set contains only module scope symbols.
@@ -8690,6 +8700,11 @@ private extern (C++) final class ExpressionSemanticVisitor : Visitor
                 exp.f = resolveFuncCall(exp.loc, sc, exp.f, tiargs, null, exp.argumentList, FuncResolveFlag.overloadOnly);
             else
             {
+                {
+                    import dmd.orderdep;
+                    if (ve.hasOverloads && orderCheck())
+                        noteOverloadUse(exp.f, exp.loc);
+                }
                 exp.f = exp.f.toAliasFunc();
                 TypeFunction tf = cast(TypeFunction)exp.f.type;
 

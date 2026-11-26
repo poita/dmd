@@ -1939,6 +1939,12 @@ FuncDeclaration resolveFuncCall(Loc loc, Scope* sc, Dsymbol s,
     if (!s)
         return null; // no match
 
+    {
+        import dmd.orderdep;
+        if (orderCheck())
+            noteOverloadUse(s, loc);
+    }
+
     version (none)
     {
         printf("resolveFuncCall() %s)\n", s.toChars());

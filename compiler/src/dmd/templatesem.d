@@ -2075,7 +2075,10 @@ bool findTempDecl(TemplateInstance ti, Scope* sc, WithScopeSymbol* pwithsym)
          */
         Identifier id = ti.name;
         Dsymbol scopesym;
+        import dmd.orderdep;
+        orderCheckTemplateName(id);
         Dsymbol s = sc.search(ti.loc, id, scopesym);
+        orderCheckTemplateName(null);
         if (!s)
         {
             s = sc.search_correct(id);
