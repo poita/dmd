@@ -1,6 +1,0 @@
-ORDERDEP absent cases.d(5) `foo` in module `cases` | observed cases.d(5) (speculative)
-ORDERDEP absent cases.d(10) `bar` in struct/union `cases.S` | observed cases.d(9) (speculative)
-ORDERDEP overload cases.d(17) `g` in module `cases` | observed cases.d(16)
-ORDERDEP sealed cases.d-mixin-22(22) `late` in struct/union `cases.T` | observed cases.d(21)
-ORDERDEP import cases.d(26) `mm` in struct/union `cases.U` | observed cases.d(28) (speculative)
-ORDERDEP absent cases.d(35) `value` in struct/union `cases.V` | observed cases.d(34)

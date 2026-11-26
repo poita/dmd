@@ -1,0 +1,36 @@
+New preview switch `-preview=orderIndependence` makes `static if` and `mixin` results independent of evaluation order
+
+`static if`, `static foreach` and `mixin` can add declarations to a scope while
+the compiler is still analyzing it. Until now, a lookup done before such a
+declaration was added could see a different answer than the same lookup done
+after, so the meaning of a program could depend on the order in which the
+compiler happened to evaluate declarations, including the order of files on the
+command line.
+
+With `-preview=orderIndependence`:
+
+$(UL
+$(LI A name declared by a `static if` or `static foreach` is found even when it
+is used before the compiler would otherwise have evaluated that `static if`.
+This fixes forward references such as
+$(LINK2 https://github.com/dlang/dmd/issues/18151, issue 18151).)
+$(LI If whether a name exists depends on the very lookup of that name, it is an error.)
+$(LI A string mixin or mixin template that declares a name after a lookup has
+already found it missing, adds an overload after overloads were resolved, or
+adds a member after `__traits(allMembers)` listed the members, is an error.)
+)
+
+-------
+static if (!is(typeof(foo))) void foo() {} // error: depends on itself
+
+struct S
+{
+    Foo f;                       // OK now, was "undefined identifier"
+}
+static if (true) struct Foo {}
+-------
+
+Code that tests whether a template's own result is "already defined" to
+short-circuit, such as `static if (!is(typeof(T) == bool)) enum T = ...;`, must
+be rewritten, for example with recursion. `core.internal.traits.anySatisfy` and
+`allSatisfy` have been rewritten this way.

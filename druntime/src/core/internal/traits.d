@@ -216,35 +216,29 @@ template dtorIsNothrow(T)
 // taken from std.meta.allSatisfy
 template allSatisfy(alias F, T...)
 {
-    static foreach (Ti; T)
-    {
-        static if (!is(typeof(allSatisfy) == bool) && // not yet defined
-                   !F!(Ti))
-        {
-            enum allSatisfy = false;
-        }
-    }
-    static if (!is(typeof(allSatisfy) == bool)) // if not yet defined
-    {
+    // short-circuits: F is not instantiated past the first failure
+    static if (T.length == 0)
         enum allSatisfy = true;
-    }
+    else static if (T.length == 1)
+        enum allSatisfy = !!F!(T[0]);
+    else static if (allSatisfy!(F, T[0 .. $ / 2]))
+        enum allSatisfy = allSatisfy!(F, T[$ / 2 .. $]);
+    else
+        enum allSatisfy = false;
 }
 
 // taken from std.meta.anySatisfy
 template anySatisfy(alias F, Ts...)
 {
-    static foreach (T; Ts)
-    {
-        static if (!is(typeof(anySatisfy) == bool) && // not yet defined
-                   F!T)
-        {
-            enum anySatisfy = true;
-        }
-    }
-    static if (!is(typeof(anySatisfy) == bool)) // if not yet defined
-    {
+    // short-circuits: F is not instantiated past the first match
+    static if (Ts.length == 0)
         enum anySatisfy = false;
-    }
+    else static if (Ts.length == 1)
+        enum anySatisfy = !!F!(Ts[0]);
+    else static if (anySatisfy!(F, Ts[0 .. $ / 2]))
+        enum anySatisfy = true;
+    else
+        enum anySatisfy = anySatisfy!(F, Ts[$ / 2 .. $]);
 }
 
 // simplified from std.traits.maxAlignment

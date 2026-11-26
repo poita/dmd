@@ -1139,6 +1139,8 @@ dmd -cov -unittest myprog.d
             "https://dlang.org/spec/attribute.html#system-variables"),
         Feature("fastdfa", "useFastDFA",
             "Fast dataflow analysis engine, experimental"),
+        Feature("orderIndependence", "orderIndependence",
+            "make `static if`, `mixin` and introspection results independent of evaluation order"),
     ];
 }
 

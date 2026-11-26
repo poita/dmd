@@ -586,7 +586,8 @@ Dsymbol search(Scope* _this, Loc loc, Identifier ident, out Dsymbol pscopesym, S
         flags |= SearchOpt.ignoreVisibility;
 
     import dmd.orderdep;
-    const odMark = orderCheck() ? orderCheckMark() : 0;
+    const od = orderCheck();
+    const odMark = od ? orderCheckBegin() : SearchMark.init;
 
     // First look in local scopes
     Dsymbol s = searchScopes(flags | SearchOpt.localsOnly);
@@ -597,9 +598,8 @@ Dsymbol search(Scope* _this, Loc loc, Identifier ident, out Dsymbol pscopesym, S
         s = searchScopes(flags | SearchOpt.importsOnly);
         version (LOGSEARCH) if (s) printMsg("-Scope.search() found import", s);
     }
-    // a non-speculative lookup that fails everywhere is an error or a deferral, not a negative fact
-    if (!s && !global.gag && orderCheck())
-        orderCheckRetract(odMark);
+    if (od)
+        orderCheckEnd(odMark, s !is null);
     return s;
 }
 
@@ -6721,6 +6721,9 @@ private extern(C++) class AddMemberVisitor : Visitor
          * }
          */
         sid.scopesym = sds;
+        import dmd.orderdep;
+        if (orderCheck())
+            notePending(sds, sid);
     }
 
 
@@ -6728,6 +6731,9 @@ private extern(C++) class AddMemberVisitor : Visitor
     {
         // used only for caching the enclosing symbol
         sfd.scopesym = sds;
+        import dmd.orderdep;
+        if (orderCheck())
+            notePending(sds, sfd);
     }
 
     /***************************************
@@ -7847,14 +7853,21 @@ private extern(C++) class SearchVisitor : Visitor
         {
             //printf(" look in locals\n");
             auto s1 = sds.symtab.lookup(ident);
+            import dmd.orderdep;
+            if (orderCheck())
+            {
+                // a pending `static if` may still declare it, or add an overload
+                if (!s1 || s1.isFuncDeclaration() || s1.isTemplateDeclaration() || s1.isOverDeclaration())
+                    if (forcePending(sds, ident, loc))
+                        s1 = sds.symtab.lookup(ident);
+                if (!s1)
+                    noteAbsent(sds, ident, loc);
+            }
             if (s1)
             {
                 //printf("\tfound in locals = '%s.%s'\n",toChars(),s1.toChars());
                 return setResult(s1);
             }
-            import dmd.orderdep;
-            if (orderCheck())
-                noteAbsent(sds, ident, loc);
         }
         //printf(" not found in locals\n");
 
@@ -8325,10 +8338,16 @@ private extern(C++) class SearchVisitor : Visitor
 
         const errors = global.errors;
 
+        import dmd.orderdep;
+        const od = orderCheck();
         m.insearch = true;
+        if (od)
+            enterModuleSearch(m);
         visit(cast(ScopeDsymbol)m);
         Dsymbol s = result;
         m.insearch = false;
+        if (od)
+            leaveModuleSearch();
 
         if (errors == global.errors)
         {
@@ -8362,9 +8381,6 @@ private extern(C++) class SearchVisitor : Visitor
 
         if (!sd.members || !sd.symtab) // opaque or semantic() is not yet called
         {
-            import dmd.orderdep;
-            if (orderCheck() && sd.members && sd.semanticRun < PASS.semanticdone)
-                noteForwardRef(sd, ident, loc);
             // .stringof is always defined (but may be hidden by some other symbol)
             if(ident != Id.stringof && !(flags & SearchOpt.ignoreErrors) && sd.semanticRun < PASS.semanticdone)
                 eSink.error(loc, "%s `%s` is forward referenced when looking for `%s`", sd.kind, sd.toPrettyChars, ident.toErrMsg());
@@ -8391,9 +8407,6 @@ private extern(C++) class SearchVisitor : Visitor
 
         if (!cd.members || !cd.symtab) // opaque or addMember is not yet done
         {
-            import dmd.orderdep;
-            if (orderCheck() && cd.members && cd.semanticRun < PASS.semanticdone)
-                noteForwardRef(cd, ident, loc);
             // .stringof is always defined (but may be hidden by some other symbol)
             if (ident != Id.stringof && !(flags & SearchOpt.ignoreErrors) && cd.semanticRun < PASS.semanticdone)
                 cd.classError("%s `%s` is forward referenced when looking for `%s`", ident.toChars());
