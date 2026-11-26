@@ -6534,10 +6534,12 @@ private extern(C++) class AddMemberVisitor : Visitor
         //printf("Dsymbol::addMember(this = %p, '%s' scopesym = '%s')\n", this, toChars(), sds.toChars());
         //printf("Dsymbol::addMember(this = %p, '%s' sds = %p, sds.symtab = %p)\n", this, toChars(), sds, sds.symtab);
         dsym.parent = sds;
+        import dmd.orderdep;
+        if (dsym.isTemplateMixin() && orderCheck())
+            noteGrowable(sds);
         if (dsym.isAnonymous()) // no name, so can't add it to symbol table
             return;
 
-        import dmd.orderdep;
         if (sds.symtabInsert(dsym))
         {
             if (orderCheck())
@@ -6750,6 +6752,9 @@ private extern(C++) class AddMemberVisitor : Visitor
     {
         //printf("MixinDeclaration::addMember(sc = %p, sds = %p, memnum = %d)\n", sc, sds, md.memnum);
         md.scopesym = sds;
+        import dmd.orderdep;
+        if (orderCheck())
+            noteGrowable(sds);
     }
 
     override void visit(DebugSymbol ds)
@@ -7854,7 +7859,7 @@ private extern(C++) class SearchVisitor : Visitor
             //printf(" look in locals\n");
             auto s1 = sds.symtab.lookup(ident);
             import dmd.orderdep;
-            if (orderCheck())
+            if (orderCheck() && mayGrow(sds))
             {
                 // a pending `static if` may still declare it, or add an overload
                 if (!s1 || s1.isFuncDeclaration() || s1.isTemplateDeclaration() || s1.isOverDeclaration())

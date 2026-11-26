@@ -44,6 +44,7 @@ import dmd.func;
 import dmd.globals;
 import dmd.identifier;
 import dmd.location;
+import dmd.root.aav : AssocArray;
 import dmd.root.array;
 import dmd.arraytypes : Dsymbols;
 
@@ -73,6 +74,17 @@ struct Key
 {
     const(void)* sds;
     const(void)* id;
+
+    // the default hash runs MurmurHash over the bytes, too slow for a lookup on every miss
+    size_t toHash() const @trusted pure nothrow @nogc
+    {
+        return (cast(size_t) sds >> 4) * 0x9E3779B97F4A7C15 ^ (cast(size_t) id >> 4);
+    }
+
+    bool opEquals(ref const Key k) const @safe pure nothrow @nogc
+    {
+        return sds is k.sds && id is k.id;
+    }
 }
 
 struct Fact
@@ -110,6 +122,7 @@ __gshared bool[Key] reported;     // (scope, ident) already reported, any kind
 __gshared Array!Key journal;      // absent facts in insertion order, for retraction (malloc based: the compiler's GC is off)
 __gshared Pending*[Key] byName;   // (scope, ident) -> conditionals that may declare ident
 __gshared Pending*[const(void)*] byScope; // scope -> all its conditionals
+__gshared AssocArray!(void*, void*) growable; // scopes in `byScope`, as a pointer-keyed table: queried on every lookup miss
 __gshared Array!Cycle cycles;     // cycles found by the lookups in progress
 __gshared int searchDepth;        // nesting of `Scope.search` in the current forcing level
 __gshared Array!Module inSearch;  // modules with `insearch` set by the current lookup
@@ -330,6 +343,7 @@ void notePending(ScopeDsymbol s, AttribDeclaration d) @trusted
     auto sk = cast(void*) s;
     auto p = sk in byScope;
     byScope[sk] = new Pending(d, p ? *p : null);
+    *growable.getLvalue(sk) = sk;
     void add(Identifier id)
     {
         auto key = Key(sk, cast(void*) id);
@@ -348,12 +362,36 @@ void notePending(ScopeDsymbol s, AttribDeclaration d) @trusted
 }
 
 /***********************************
+ * Register scope `s` as one that can still receive declarations after
+ * semantic analysis started (it holds a `mixin` or a template mixin).
+ */
+void noteGrowable(ScopeDsymbol s) @trusted
+{
+    s = owner(s);
+    if (!tracked(s))
+        return;
+    auto sk = cast(void*) s;
+    if (!(sk in byScope))
+        byScope[sk] = null;
+    *growable.getLvalue(sk) = sk;
+}
+
+/***********************************
+ * Returns: true if declarations may still be added to `sds` after
+ * semantic analysis started. Lookups in other scopes need no bookkeeping.
+ */
+bool mayGrow(ScopeDsymbol sds) @trusted
+{
+    return growable.length && growable[cast(void*) owner(sds)] !is null;
+}
+
+/***********************************
  * Expand the pending conditionals of `sds` that may declare `id`.
  * Returns: true if any was expanded, the caller should look again
  */
 bool forcePending(ScopeDsymbol sds, Identifier id, Loc loc) @trusted
 {
-    if (!byName.length || sds.isForwardingScopeDsymbol())
+    if (sds.isForwardingScopeDsymbol())
         return false;
     auto s = owner(sds);
     if (isOwnTemplateName(s, id))
@@ -418,10 +456,10 @@ void noteAbsent(ScopeDsymbol s, Identifier id, Loc loc) @trusted
     if (isOwnTemplateName(s, id))
         return;
     auto key = Key(cast(void*) s, cast(void*) id);
-    if (key in absent)
-        return;
-    absent[key] = Fact(loc, global.gag != 0);
-    journal.push(key);
+    bool added;
+    absent.require(key, { added = true; return Fact(loc, global.gag != 0); }());
+    if (added)
+        journal.push(key);
 }
 
 /// State of the recording at the start of an unqualified lookup
