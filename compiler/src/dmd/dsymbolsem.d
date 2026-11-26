@@ -585,6 +585,9 @@ Dsymbol search(Scope* _this, Loc loc, Identifier ident, out Dsymbol pscopesym, S
     if (_this.ignoresymbolvisibility)
         flags |= SearchOpt.ignoreVisibility;
 
+    import dmd.orderdep;
+    const odMark = orderCheck() ? orderCheckMark() : 0;
+
     // First look in local scopes
     Dsymbol s = searchScopes(flags | SearchOpt.localsOnly);
     version (LOGSEARCH) if (s) printMsg("-Scope.search() found local", s);
@@ -594,6 +597,9 @@ Dsymbol search(Scope* _this, Loc loc, Identifier ident, out Dsymbol pscopesym, S
         s = searchScopes(flags | SearchOpt.importsOnly);
         version (LOGSEARCH) if (s) printMsg("-Scope.search() found import", s);
     }
+    // a non-speculative lookup that fails everywhere is an error or a deferral, not a negative fact
+    if (!s && !global.gag && orderCheck())
+        orderCheckRetract(odMark);
     return s;
 }
 
@@ -601,6 +607,10 @@ Dsymbol search_correct(Scope* _this, Identifier ident)
 {
     if (global.gag)
         return null; // don't do it for speculative compiles; too time consuming
+
+    import dmd.orderdep;
+    orderCheckSuspend();
+    scope (exit) orderCheckResume();
 
     /************************************************
      * Given the failed search attempt, try to find
@@ -3751,7 +3761,11 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
 
             if (!imp.isstatic)
             {
+                import dmd.orderdep;
+                const added = orderCheck() && !isImported(scopesym, imp.mod);
                 scopesym.importScope(imp.mod, imp.visibility);
+                if (added)
+                    checkImport(scopesym, imp.mod, imp.loc);
             }
 
 
@@ -6489,7 +6503,13 @@ private extern(C++) class AddMemberVisitor : Visitor
         if (dsym.isAnonymous()) // no name, so can't add it to symbol table
             return;
 
-        if (!sds.symtabInsert(dsym)) // if name is already defined
+        import dmd.orderdep;
+        if (sds.symtabInsert(dsym))
+        {
+            if (orderCheck())
+                checkInsert(sds, dsym, false);
+        }
+        else // if name is already defined
         {
             if (dsym.isAliasDeclaration() && !dsym._scope)
                 dsym.setScope(sc);
@@ -6525,7 +6545,12 @@ private extern(C++) class AddMemberVisitor : Visitor
                 return;
             }
 
-            if (!s2.overloadInsert(dsym))
+            if (s2.overloadInsert(dsym))
+            {
+                if (orderCheck())
+                    checkInsert(sds, dsym, true);
+            }
+            else
             {
                 if (auto _td = s2.isTemplateDeclaration())
                     _td.computeOneMember();
@@ -7837,6 +7862,9 @@ private extern(C++) class SearchVisitor : Visitor
                 //printf("\tfound in locals = '%s.%s'\n",toChars(),s1.toChars());
                 return setResult(s1);
             }
+            import dmd.orderdep;
+            if (orderCheck())
+                noteAbsent(sds, ident, loc);
         }
         //printf(" not found in locals\n");
 
@@ -8327,6 +8355,9 @@ private extern(C++) class SearchVisitor : Visitor
 
         if (!sd.members || !sd.symtab) // opaque or semantic() is not yet called
         {
+            import dmd.orderdep;
+            if (orderCheck() && sd.members && sd.semanticRun < PASS.semanticdone)
+                noteForwardRef(sd, ident, loc);
             // .stringof is always defined (but may be hidden by some other symbol)
             if(ident != Id.stringof && !(flags & SearchOpt.ignoreErrors) && sd.semanticRun < PASS.semanticdone)
                 eSink.error(loc, "%s `%s` is forward referenced when looking for `%s`", sd.kind, sd.toPrettyChars, ident.toErrMsg());
@@ -8353,6 +8384,9 @@ private extern(C++) class SearchVisitor : Visitor
 
         if (!cd.members || !cd.symtab) // opaque or addMember is not yet done
         {
+            import dmd.orderdep;
+            if (orderCheck() && cd.members && cd.semanticRun < PASS.semanticdone)
+                noteForwardRef(cd, ident, loc);
             // .stringof is always defined (but may be hidden by some other symbol)
             if (ident != Id.stringof && !(flags & SearchOpt.ignoreErrors) && cd.semanticRun < PASS.semanticdone)
                 cd.classError("%s `%s` is forward referenced when looking for `%s`", ident.toChars());
@@ -8609,7 +8643,13 @@ extern(C++) class ImportAllVisitor : Visitor
         if (sc.explicitVisibility)
             imp.visibility = sc.visibility;
         if (!imp.isstatic && !imp.aliasId && !imp.names.length)
+        {
+            import dmd.orderdep;
+            const added = orderCheck() && !isImported(sc.scopesym, imp.mod);
             sc.scopesym.importScope(imp.mod, imp.visibility);
+            if (added)
+                checkImport(sc.scopesym, imp.mod, imp.loc);
+        }
         // Enable access to pkgs/mod as soon as posible, because compiler
         // can traverse them before the import gets semantic (Issue: 21501)
         if (!imp.aliasId && !imp.names.length)

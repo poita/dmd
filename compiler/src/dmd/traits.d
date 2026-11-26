@@ -1224,6 +1224,11 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
                 if (dte.e1.op != EXP.dotType && dte.e1.op != EXP.this_)
                     ex = dte.e1;
             }
+            {
+                import dmd.orderdep;
+                if (orderCheck() && f)
+                    noteOverloadUse(f, e.loc);
+            }
             bool[string] funcTypeHash;
 
             /* Compute the function signature and insert it in the
@@ -1854,6 +1859,17 @@ Expression semanticTraits(TraitsExp e, Scope* sc)
             }
 
             pushBaseMembersDg(cd);
+        }
+
+        {
+            import dmd.orderdep;
+            if (orderCheck())
+            {
+                noteSeal(sds, (*idents)[], e.loc);
+                if (cd && e.ident == Id.allMembers)
+                    for (auto b = cd.baseClass; b; b = b.baseClass)
+                        noteSeal(b, (*idents)[], e.loc);
+            }
         }
 
         // Turn Identifiers into StringExps reusing the allocated array
