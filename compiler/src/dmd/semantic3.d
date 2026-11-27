@@ -92,6 +92,10 @@ enum LOG = false;
  */
 void semantic3(Dsymbol dsym, Scope* sc)
 {
+    import dmd.orderdep : orderCheckBarrier, orderCheckLeave;
+    const barrier = orderCheckBarrier();
+    scope (exit) if (barrier)
+        orderCheckLeave();
     scope v = new Semantic3Visitor(sc);
     dsym.accept(v);
 }

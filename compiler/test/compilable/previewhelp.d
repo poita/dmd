@@ -21,5 +21,6 @@ Upcoming language changes listed by -preview=name:
   =systemVariables  disable access to variables marked '@system' from @safe code (https://dlang.org/spec/attribute.html#system-variables)
   =fastdfa          Fast dataflow analysis engine, experimental
   =orderIndependence make `static if`, `mixin` and introspection results independent of evaluation order
+  =orderIndependenceLexical like orderIndependence, but a `static if` condition only sees the conditionals before it in its scope
 ----
 */

@@ -219,6 +219,7 @@ extern (C++) struct Param
     FeatureState systemVariables; // limit access to variables marked @system from @safe code
     bool useFastDFA;                 // Use fast data flow analysis engine
     bool orderIndependence;          // reject declarations that change the result of an earlier lookup
+    bool orderIndependenceLexical;   // same, but a condition only sees the conditionals before it in its scope
 
     CHECKENABLE useInvariants  = CHECKENABLE._default;  // generate class invariant checks
     CHECKENABLE useIn          = CHECKENABLE._default;  // generate precondition checks

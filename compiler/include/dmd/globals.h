@@ -241,6 +241,7 @@ struct Param
     FeatureState systemVariables; // limit access to variables marked @system from @safe code
     d_bool useFastDFA;             // Use fast data flow analysis engine
     d_bool orderIndependence;      // reject declarations that change the result of an earlier lookup
+    d_bool orderIndependenceLexical; // same, but a condition only sees the conditionals before it in its scope
 
     CHECKENABLE useInvariants;     // generate class invariant checks
     CHECKENABLE useIn;             // generate precondition checks

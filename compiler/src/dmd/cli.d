@@ -1141,6 +1141,8 @@ dmd -cov -unittest myprog.d
             "Fast dataflow analysis engine, experimental"),
         Feature("orderIndependence", "orderIndependence",
             "make `static if`, `mixin` and introspection results independent of evaluation order"),
+        Feature("orderIndependenceLexical", "orderIndependenceLexical",
+            "like orderIndependence, but a `static if` condition only sees the conditionals before it in its scope"),
     ];
 }
 

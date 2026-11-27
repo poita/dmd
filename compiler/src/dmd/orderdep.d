@@ -55,7 +55,13 @@ private __gshared int suspended;    // > 0 while lookups must not be recorded (s
 /// Returns: true if order independence is enforced
 bool orderCheck() @trusted
 {
-    return global.params.orderIndependence && suspended == 0;
+    return (global.params.orderIndependence || global.params.orderIndependenceLexical) && suspended == 0;
+}
+
+/// Returns: true if conditions only see the conditionals before them in their scope
+private bool lexical() @trusted
+{
+    return global.params.orderIndependenceLexical;
 }
 
 /// Suspend / resume recording, e.g. during spelling correction
@@ -91,6 +97,7 @@ struct Fact
 {
     Loc loc;
     bool gagged;
+    Cond* horizon;  // lexical mode: the condition that made the lookup, it does not see itself and later conditionals
 }
 
 struct Seal
@@ -104,6 +111,23 @@ struct Pending
 {
     AttribDeclaration d;
     Pending* next;
+}
+
+/// Position of a `static if` / `static foreach` in the source order of its scope:
+/// the path of indices from the scope through enclosing conditionals
+struct Cond
+{
+    Cond* parent;       // enclosing conditional, or the scope's root
+    uint seq;           // index among the parent's conditionals
+    uint nchildren;
+}
+
+/// A `static if` / `static foreach` being evaluated
+struct Frame
+{
+    AttribDeclaration d;
+    ScopeDsymbol s;     // owner of the table it adds to
+    bool expanding;     // false while its condition / aggregate is evaluated
 }
 
 /// A lookup that hit a `static if` / `static foreach` being expanded
@@ -126,6 +150,9 @@ __gshared AssocArray!(void*, void*) growable; // scopes in `byScope`, as a point
 __gshared Array!Cycle cycles;     // cycles found by the lookups in progress
 __gshared int searchDepth;        // nesting of `Scope.search` in the current forcing level
 __gshared Array!Module inSearch;  // modules with `insearch` set by the current lookup
+__gshared AssocArray!(void*, Cond*) conds; // conditional -> its position
+__gshared AssocArray!(void*, Cond*) roots; // scope -> root of its positions
+__gshared Array!Frame frames;     // conditionals being evaluated, innermost last
 
 /// Resolve forwarding scopes (`static foreach` bodies) to the scope that owns the table
 ScopeDsymbol owner(ScopeDsymbol s) @safe
@@ -248,6 +275,51 @@ bool isInternal(Identifier id) @trusted
     return s.length >= 2 && s[0] == '_' && s[1] == '_';
 }
 
+/// Returns: true if `a` comes before `b` in the source order of their scope
+bool before(const(Cond)* a, const(Cond)* b) @trusted
+{
+    uint[16] pa, pb;
+    size_t na, nb;
+    for (auto c = a; c.parent; c = c.parent)
+        pa[na++ % pa.length] = c.seq;
+    for (auto c = b; c.parent; c = c.parent)
+        pb[nb++ % pb.length] = c.seq;
+    if (na > pa.length || nb > pb.length)
+        return false;   // too deep to tell, treat as not before
+    foreach (i; 0 .. na < nb ? na : nb)
+    {
+        const x = pa[na - 1 - i], y = pb[nb - 1 - i];
+        if (x != y)
+            return x < y;
+    }
+    return na < nb;     // an enclosing conditional comes first
+}
+
+/***********************************
+ * Lexical mode: the conditional of scope `s` whose condition is being
+ * evaluated by the innermost frame, if the lookup comes straight from it.
+ */
+Cond* origin(ScopeDsymbol s) @trusted
+{
+    if (!lexical() || !frames.length)
+        return null;
+    auto f = &frames[frames.length - 1];
+    if (f.expanding || f.s !is s)
+        return null;
+    return conds[cast(void*) f.d];
+}
+
+/// The conditional of scope `s` adding members right now, if any
+Cond* inserter(ScopeDsymbol s) @trusted
+{
+    if (!frames.length)
+        return null;
+    auto f = &frames[frames.length - 1];
+    if (!f.expanding || f.s !is s)
+        return null;
+    return conds[cast(void*) f.d];
+}
+
 /// `Foo!(...)` inside an instance of template `Foo` always refers to the
 /// template, even after a member named `Foo` exists (findTempDecl), so a
 /// member inserted later cannot change the answer.
@@ -275,6 +347,14 @@ bool isOnStack(AttribDeclaration d) @trusted
     if (auto sif = d.isStaticIfDeclaration())
         return sif.onStack;
     return (cast(StaticForeachDeclaration) d).onStack;
+}
+
+size_t timesForced(ref Array!AttribDeclaration forced, AttribDeclaration d) @trusted
+{
+    size_t n;
+    foreach (f; forced[])
+        n += f is d;
+    return n;
 }
 
 /// Expand `d`, outside of the lookup that triggered it
@@ -344,6 +424,17 @@ void notePending(ScopeDsymbol s, AttribDeclaration d) @trusted
     auto p = sk in byScope;
     byScope[sk] = new Pending(d, p ? *p : null);
     *growable.getLvalue(sk) = sk;
+
+    Cond* parent = inserter(s);
+    if (!parent)
+    {
+        auto r = roots.getLvalue(sk);
+        if (!*r)
+            *r = new Cond();
+        parent = *r;
+    }
+    *conds.getLvalue(cast(void*) d) = new Cond(parent, parent.nchildren++);
+
     void add(Identifier id)
     {
         auto key = Key(sk, cast(void*) id);
@@ -397,6 +488,8 @@ bool forcePending(ScopeDsymbol sds, Identifier id, Loc loc) @trusted
     if (isOwnTemplateName(s, id))
         return false;
     auto key = Key(cast(void*) s, cast(void*) id);
+    auto from = origin(s);
+    Array!AttribDeclaration forced;
     bool any;
     for (bool progress = true; progress; )
     {
@@ -413,6 +506,17 @@ bool forcePending(ScopeDsymbol sds, Identifier id, Loc loc) @trusted
                 e = e.next;
                 continue;
             }
+            if (from)
+            {
+                auto c = conds[cast(void*) e.d];
+                if (c is from || !before(c, from))
+                {
+                    // not visible to this condition
+                    link = &e.next;
+                    e = e.next;
+                    continue;
+                }
+            }
             if (isOnStack(e.d))
             {
                 // `id` depends on the result of this very lookup
@@ -425,8 +529,12 @@ bool forcePending(ScopeDsymbol sds, Identifier id, Loc loc) @trusted
                         cycles.push(c);
                 }
             }
-            else if (e.d._scope)
+            else if (e.d._scope && timesForced(forced, e.d) < 2)
             {
+                // A forced conditional can stay pending: a `static foreach`
+                // whose aggregate is not ready, or a speculative condition
+                // that hit an error (retried once, after the error was reported).
+                forced.push(e.d);
                 force(e.d);
                 progress = any = true;
                 break;      // the list may have changed
@@ -446,6 +554,42 @@ void enterModuleSearch(Module m) @trusted { inSearch.push(m); }
 void leaveModuleSearch() @trusted { inSearch.pop(); }
 
 /***********************************
+ * Bracket the evaluation of a `static if` / `static foreach`: its
+ * condition first, then (`orderCheckExpanding`) the addition of its members.
+ */
+void orderCheckEnter(AttribDeclaration d, ScopeDsymbol scopesym) @trusted
+{
+    frames.push(Frame(d, owner(scopesym), false));
+}
+
+/***********************************
+ * Lexical mode: start the semantic analysis of another declaration. A
+ * lookup it makes does not come straight from the condition being
+ * evaluated, and its result can be cached and seen from anywhere, so it
+ * must see every conditional.
+ * Returns: true if a frame was pushed, to pop with `orderCheckLeave`
+ */
+bool orderCheckBarrier() @trusted
+{
+    if (!frames.length || !lexical())
+        return false;
+    frames.push(Frame(null, null, false));
+    return true;
+}
+
+/// ditto
+void orderCheckExpanding() @trusted
+{
+    frames[frames.length - 1].expanding = true;
+}
+
+/// ditto
+void orderCheckLeave() @trusted
+{
+    frames.pop();
+}
+
+/***********************************
  * Record that `id` was looked up in the local table of `s` and not found.
  */
 void noteAbsent(ScopeDsymbol s, Identifier id, Loc loc) @trusted
@@ -457,7 +601,7 @@ void noteAbsent(ScopeDsymbol s, Identifier id, Loc loc) @trusted
         return;
     auto key = Key(cast(void*) s, cast(void*) id);
     bool added;
-    absent.require(key, { added = true; return Fact(loc, global.gag != 0); }());
+    absent.require(key, { added = true; return Fact(loc, global.gag != 0, origin(s)); }());
     if (added)
         journal.push(key);
 }
@@ -577,9 +721,15 @@ void checkInsert(ScopeDsymbol s, Dsymbol sym, bool overload) @trusted
         return;
     if (auto f = key in absent)
     {
+        // lexical mode: the lookup was not meant to see this conditional
+        if (f.horizon)
+            if (auto c = inserter(s))
+                if (c is f.horizon || !before(c, f.horizon))
+                    goto Lnotabsent;
         reported[key] = true;
         return report(Kind.absent, s, sym.ident, sym.loc, f.loc, f.gagged);
     }
+Lnotabsent:
     if (overload)
     {
         if (auto f = key in overloads)

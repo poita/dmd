@@ -726,6 +726,10 @@ Scope* scopeCreateGlobal(Module _module, ErrorSink eSink)
  */
 void dsymbolSemantic(Dsymbol dsym, Scope* sc)
 {
+    import dmd.orderdep : orderCheckBarrier, orderCheckLeave;
+    const barrier = orderCheckBarrier();
+    scope (exit) if (barrier)
+        orderCheckLeave();
     scope v = new DsymbolSemanticVisitor(sc);
     dsym.accept(v);
 }
@@ -9690,6 +9694,12 @@ extern(C++) class ConditionIncludeVisitor : Visitor
         {
             assert(sif.scopesym); // addMember is already done
             assert(sif._scope); // setScope is already done
+            import dmd.orderdep;
+            const od = orderCheck();
+            if (od)
+                orderCheckEnter(sif, sif.scopesym);
+            scope (exit) if (od)
+                orderCheckLeave();
 
             Scope* saved_scope = sc;
             sc = sif._scope;
@@ -9699,6 +9709,8 @@ extern(C++) class ConditionIncludeVisitor : Visitor
 
             if (d && !sif.addisdone)
             {
+                if (od)
+                    orderCheckExpanding();
                 // Add members lazily.
                 d.foreachDsymbol( s => s.addMember(sif._scope, sif.scopesym) );
 
@@ -9731,6 +9743,12 @@ extern(C++) class ConditionIncludeVisitor : Visitor
         }
         sfd.onStack = true;
         scope(exit) sfd.onStack = false;
+        import dmd.orderdep;
+        const od = orderCheck() && sfd.scopesym;
+        if (od)
+            orderCheckEnter(sfd, sfd.scopesym);
+        scope (exit) if (od)
+            orderCheckLeave();
 
         if (sfd._scope)
         {
@@ -9747,6 +9765,8 @@ extern(C++) class ConditionIncludeVisitor : Visitor
         Dsymbols* d = makeTupleForeach(sfd._scope, true, true, sfd.sfe.aggrfe, sfd.decl, sfd.sfe.needExpansion).decl;
         if (d) // process generated declarations
         {
+            if (od)
+                orderCheckExpanding();
             // Add members lazily.
             d.foreachDsymbol( s => s.addMember(sfd._scope, sfd.scopesym) );
 

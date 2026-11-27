@@ -34,3 +34,10 @@ Code that tests whether a template's own result is "already defined" to
 short-circuit, such as `static if (!is(typeof(T) == bool)) enum T = ...;`, must
 be rewritten, for example with recursion. `core.internal.traits.anySatisfy` and
 `allSatisfy` have been rewritten this way.
+
+`-preview=orderIndependenceLexical` is an alternative to `-preview=orderIndependence`
+that keeps that idiom working: the condition of a `static if` or `static foreach`
+does not see declarations from its own or later `static if` / `static foreach`
+declarations of the same scope, so it is answered from the ones before it.
+Everything else, including lookups from other declarations that the condition
+uses, still sees every declaration.
