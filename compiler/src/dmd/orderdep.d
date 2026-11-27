@@ -98,6 +98,7 @@ struct Fact
     Loc loc;
     bool gagged;
     Cond* horizon;  // lexical mode: the condition that made the lookup, it does not see itself and later conditionals
+    bool modules;   // imported modules were searched too, not just the local table
 }
 
 struct Seal
@@ -592,7 +593,7 @@ void orderCheckLeave() @trusted
 /***********************************
  * Record that `id` was looked up in the local table of `s` and not found.
  */
-void noteAbsent(ScopeDsymbol s, Identifier id, Loc loc) @trusted
+void noteAbsent(ScopeDsymbol s, Identifier id, Loc loc, bool modules) @trusted
 {
     s = owner(s);
     if (!tracked(s))
@@ -601,7 +602,8 @@ void noteAbsent(ScopeDsymbol s, Identifier id, Loc loc) @trusted
         return;
     auto key = Key(cast(void*) s, cast(void*) id);
     bool added;
-    absent.require(key, { added = true; return Fact(loc, global.gag != 0, origin(s)); }());
+    auto f = &absent.require(key, { added = true; return Fact(loc, global.gag != 0, origin(s)); }());
+    f.modules |= modules;
     if (added)
         journal.push(key);
 }
@@ -799,6 +801,9 @@ void checkImport(ScopeDsymbol s, Dsymbol imported, Loc loc) @trusted
             continue;
         if (auto f = key in absent)
         {
+            // a module import cannot hide a local symbol
+            if (!f.modules && imported.isModule())
+                continue;
             reported[key] = true;
             report(Kind.import_, s, cast(Identifier) kv.key, loc, f.loc, f.gagged);
         }

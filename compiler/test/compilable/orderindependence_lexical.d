@@ -36,3 +36,10 @@ static assert(r);
 // Forward references from ordinary code still work
 struct Bar { Foo foo; }
 static if (true) struct Foo {}
+
+// A function literal in a condition is part of the condition
+static if (__traits(compiles, { import imports.orderindependence_c; oic(0); }))
+    import imports.orderindependence_c;
+else
+    int oic(int);
+static assert(oic(2) == 2);

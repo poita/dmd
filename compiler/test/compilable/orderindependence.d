@@ -48,3 +48,16 @@ template Len(T...)
     else enum Len = 1 + Len!(T[1 .. $]);
 }
 static assert(Len!(int, long) == 2);
+
+// A module import in a condition's body does not hide a symbol that the
+// condition found through a closer import
+struct ImportInBody(T)
+{
+    static if (__traits(compiles, { import imports.orderindependence_c; auto x = oic(T.init); }))
+    {
+        import imports.orderindependence_c;
+        int f() { return oic(1); }
+    }
+}
+alias ImportInBodyInt = ImportInBody!int;
+static assert(ImportInBodyInt.init.f() == 1);

@@ -93,7 +93,8 @@ enum LOG = false;
 void semantic3(Dsymbol dsym, Scope* sc)
 {
     import dmd.orderdep : orderCheckBarrier, orderCheckLeave;
-    const barrier = orderCheckBarrier();
+    // a function literal belongs to the condition that contains it
+    const barrier = !dsym.isFuncLiteralDeclaration() && orderCheckBarrier();
     scope (exit) if (barrier)
         orderCheckLeave();
     scope v = new Semantic3Visitor(sc);

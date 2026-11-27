@@ -727,7 +727,8 @@ Scope* scopeCreateGlobal(Module _module, ErrorSink eSink)
 void dsymbolSemantic(Dsymbol dsym, Scope* sc)
 {
     import dmd.orderdep : orderCheckBarrier, orderCheckLeave;
-    const barrier = orderCheckBarrier();
+    // a function literal belongs to the condition that contains it
+    const barrier = !dsym.isFuncLiteralDeclaration() && orderCheckBarrier();
     scope (exit) if (barrier)
         orderCheckLeave();
     scope v = new DsymbolSemanticVisitor(sc);
@@ -7870,7 +7871,7 @@ private extern(C++) class SearchVisitor : Visitor
                     if (forcePending(sds, ident, loc))
                         s1 = sds.symtab.lookup(ident);
                 if (!s1)
-                    noteAbsent(sds, ident, loc);
+                    noteAbsent(sds, ident, loc, !(flags & SearchOpt.localsOnly));
             }
             if (s1)
             {
@@ -7879,6 +7880,12 @@ private extern(C++) class SearchVisitor : Visitor
             }
         }
         //printf(" not found in locals\n");
+        if (flags & SearchOpt.importsOnly)
+        {
+            import dmd.orderdep;
+            if (orderCheck() && mayGrow(sds))
+                noteAbsent(sds, ident, loc, true);
+        }
 
         // Look in imported scopes
         if (!sds.importedScopes)
